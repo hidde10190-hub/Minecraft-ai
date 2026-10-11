@@ -1,0 +1,104 @@
+# ==============================================================================
+# Autonomous Standalone Fabric Client - Docker Compose Configuration
+# ==============================================================================
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+# ==============================================================================
+services:
+  minecraft-standalone-client:
+    image: eclipse-temurin:25-jdk-noble
+    container_name: minecraft-fabric-standalone
+    restart: unless-stopped
+    working_dir: /app/framework
+    env_file:
+      - config.env
+    volumes:
+      - .:/app
+    ports:
+      - "8080:8080"
+      - "8079:8080"
+    environment:
+      - MINECRAFT_SERVER=${MINECRAFT_SERVER:-host.docker.internal:25565}
+      - BOT_NAME=${BOT_NAME:-${MINECRAFT_BOT_USERNAME:-Gemini}}
+      - MINECRAFT_BOT_USERNAME=${MINECRAFT_BOT_USERNAME:-${BOT_NAME:-Gemini}}
+      - AI_IPC_PORT=8080
+      - JAVA_TOOL_OPTIONS=-Xmx8G -Xms512M -Dfabric.gui.disable=true -XX:+UseG1GC
+    # Resources: Giving the AI more RAM and CPU as requested.
+    # On Docker Desktop (Windows/Mac), ensure you also increase resources in Docker Settings.
+    deploy:
+      resources:
+        limits:
+          cpus: '8.0'      # Allow up to 8 CPU cores
+          memory: 12G      # Allow up to 12GB RAM
+        reservations:
+          cpus: '2.0'      # Reserve 2 CPU cores
+          memory: 4G       # Reserve 4GB RAM
+    
+    # Enable hardware acceleration if a GPU is present (requires nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    shm_size: '2gb'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils > /dev/null 2>&1 || true &&
+               rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true &&
+               rm -rf .gradle/loom-cache 2>/dev/null || true &&
+               Xvfb :99 -screen 0 1024x768x16 &
+               export DISPLAY=:99 &&
+               export MINECRAFT_SERVER_HOST=\"$$MINECRAFT_SERVER\" &&
+               export MINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" &&
+               echo '=====================================================' &&
+               echo ' [Standalone Container] Launching Fabric Client (Java 25)' &&
+               echo ' Server   : '\"$$MINECRAFT_SERVER\" &&
+               echo ' Username : '\"$$BOT_NAME\" &&
+               echo '=====================================================' &&
+               chmod +x ./gradlew && 
+               (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon || 
+                (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon))"
+
+  web-dashboard:
+    image: node:22-slim
+    container_name: minecraft-ai-dashboard
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - config.env
+    volumes:
+      - .:/app
+    ports:
+      - "3000:3000"
+    environment:
+      - MINECRAFT_SERVER_HOST=host.docker.internal
+      - MINECRAFT_SERVER_PORT=25565
+      - BRIDGE_HOST=minecraft-standalone-client
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: >
+      bash -c "echo '=====================================================' &&
+               echo ' [Web Dashboard] Initializing environment...' &&
+               echo '=====================================================' &&
+               apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1 || true &&
+               (npm install || (echo 'Retrying npm install...' && sleep 5 && npm install)) && 
+               echo '=====================================================' &&
+               echo ' [Web Dashboard] Building Application...' &&
+               echo '=====================================================' &&
+               (npm run build || (echo 'Build failed, trying clean build...' && rm -rf dist && npm run build)) &&
+               echo '=====================================================' &&
+               echo ' [Web Dashboard] Starting Server on port 3000...' &&
+               echo '=====================================================' &&
+               npm start"
+
+volumes:
+  ollama_data:
+
+networks:
+  default:
+    name: minecraft-ai-network

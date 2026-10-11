@@ -1,0 +1,40 @@
+[
+  {
+    "id": "fail_1791022773029_556",
+    "timestamp": "2026-10-03T10:19:33.030Z",
+    "target": "oak_log",
+    "attemptedKey": "attack",
+    "attemptedDurationMs": 800,
+    "requiredDurationMs": 1500,
+    "tool": "oak_log",
+    "reason": "Attempted to mine 'oak_log' with 'oak_log' for only 800ms. The block was NOT broken! 'oak_log' requires at least 1500ms continuous attack key hold.",
+    "correctionAdvice": "Hold the attack key for at least 1875ms continuously. Never release early.",
+    "resolved": true,
+    "resolvedInSkillId": "skill_mine_oak_log"
+  },
+  {
+    "id": "fail_1790694886313",
+    "timestamp": "2026-09-29T15:14:46.313Z",
+    "target": "oak_log",
+    "attemptedKey": "attack",
+    "attemptedDurationMs": 400,
+    "requiredDurationMs": 1500,
+    "tool": "bare_hand",
+    "reason": "The oak_log block was NOT broken! Attack was held for only 400ms.",
+    "correctionAdvice": "Hold attack for at least 2000ms continuously.",
+    "resolved": false
+  },
+  {
+    "id": "fail_init_sample",
+    "timestamp": "2026-09-29T11:45:00.000Z",
+    "target": "oak_log",
+    "attemptedKey": "attack",
+    "attemptedDurationMs": 400,
+    "requiredDurationMs": 1500,
+    "tool": "bare_hand",
+    "reason": "Attack key was pressed for only 400ms. The oak_log block was NOT broken because wood requires at least 1500ms continuous attack time!",
+    "correctionAdvice": "Increase attack key duration to 2000ms. Keep mouse aimed at block until break packet confirms destruction.",
+    "resolved": true,
+    "resolvedInSkillId": "skill_mine_wood_hand"
+  }
+]
