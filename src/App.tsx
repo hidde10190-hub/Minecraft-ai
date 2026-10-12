@@ -25,7 +25,7 @@ import { PROJECT_SOURCE_FILES } from "./data/sourceFiles";
 import { playChatChime } from "./utils/audioChime";
 import { solveBuiltinTacticalPlan } from "./utils/builtinAiEngine";
 import { generateChunk } from "./utils/worldMapGenerator";
-import { generate3DBlockCubeMap, formatCubeMapForAiPrompt } from "./utils/cubeMapEngine";
+import { generate3DBlockCubeMap, fetchLiveCubeMap, formatCubeMapForAiPrompt } from "./utils/cubeMapEngine";
 import { normalizeLivePlayerState, normalizeLiveHotbar } from "./utils/playerStateNormalizer";
 import { loadSavedEnvConfig, persistEnvConfig } from "./utils/envConfigManager";
 import { evaluateMessageForSwarm } from "./utils/signAndMessageIntelligence";
@@ -1279,11 +1279,12 @@ export default function App() {
     } else if (action.type === "request_cube_map" || action.type === "scan_3d_cube") {
       const r = action.radius || 3;
       const centerPos: [number, number, number] = action.center || [Math.round(player.x), Math.round(player.y), Math.round(player.z)];
-      const cube = generate3DBlockCubeMap(centerPos, r);
-      setThoughtLog((prev) => [
-        `[3D Voxel Perception]: Scanned ${cube.totalBlocks} blocks (Radius ${r}). Ores: ${cube.summary.ores.length} (${cube.summary.ores.map(o => o.name).slice(0, 3).join(", ") || "None"}), Hazards: ${cube.summary.hazards.length}, Solid: ${cube.summary.densityPct}%.`,
-        ...prev
-      ]);
+      fetchLiveCubeMap(centerPos, r).then(({ cube, source }) => {
+        setThoughtLog((prev) => [
+          `[3D Voxel Perception]: ${source === "live_minecraft_world" ? "LIVE WORLD SCAN" : "Simulated scan (bridge offline)"} of ${cube.totalBlocks} blocks (Radius ${r}) at [${centerPos.join(", ")}]. Ores: ${cube.summary.ores.length} (${cube.summary.ores.map(o => o.name).slice(0, 3).join(", ") || "None"}), Hazards: ${cube.summary.hazards.length}, Solid: ${cube.summary.densityPct}%.`,
+          ...prev
+        ]);
+      });
     } else if (action.type === "drop_item") {
       setPlayer((p) => {
         const newHotbar = [...p.hotbar];
@@ -1418,8 +1419,10 @@ export default function App() {
       const executionFeedback = feedbackEngine.generatePromptFeedbackString();
       const detectedMistakes = feedbackEngine.getMistakes();
 
-      // Generate surrounding 3D Block Cube Map (Radius 3 = 7x7x7 = 343 voxels)
-      const currentCube = generate3DBlockCubeMap([Math.round(player.x), Math.round(player.y), Math.round(player.z)], 3);
+      // Generate surrounding 3D Block Cube Map — LIVE world blocks when the Fabric bridge is
+      // connected (real coordinates, real block identities), procedural only as offline fallback.
+      const scanCenter: [number, number, number] = [Math.round(player.x), Math.round(player.y), Math.round(player.z)];
+      const { cube: currentCube, source: cubeSource } = await fetchLiveCubeMap(scanCenter, 3);
       const cubeSummary = formatCubeMapForAiPrompt(currentCube);
 
       // Unified AI Routing Strategy (NVIDIA -> Gemini -> Ollama -> Built-in)
@@ -1427,6 +1430,7 @@ export default function App() {
         telemetry: { player, raycast, nearbyEntities: entities },
         goal,
         cubeMap: currentCube,
+        cubeSource,
         cubeSummary,
         executionFeedback,
         detectedMistakes,

@@ -1333,6 +1333,33 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
 
   const agentName = agentContext?.name || "Omega-Assistant";
   const agentRole = agentContext?.role || "Assistant";
+
+  // SERVER-SIDE LIVE SCAN OVERRIDE: whenever the bot is connected, ALWAYS re-read the cube map
+  // directly from the Fabric bridge's real world. This makes coordinate ground truth identical
+  // for every provider tier (NVIDIA/Gemini/Ollama/Built-in) and immune to stale or procedurally
+  // simulated maps arriving from any client path.
+  let liveCubeScanned = false;
+  try {
+    const pl = telemetry?.player || {};
+    const sx = Math.round(pl.x ?? 0), sy = Math.round(pl.y ?? 64), sz = Math.round(pl.z ?? 0);
+    const scanRadius = Math.min(8, Math.max(1, parseInt(String(cubeMap?.radius ?? 3), 10) || 3));
+    const base = await getWorkingBridgeBase("8080");
+    if (base) {
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 2500);
+      const bridgeRes = await fetch(`${base}/api/cube-map?x=${sx}&y=${sy}&z=${sz}&radius=${scanRadius}`, { signal: controller.signal });
+      clearTimeout(tid);
+      if (bridgeRes.ok) {
+        const liveData: any = await bridgeRes.json();
+        if (liveData && Array.isArray(liveData.voxels) && liveData.voxels.length >= 0 && String(liveData.source || "").includes("live")) {
+          cubeMap = { ...liveData, center: liveData.center || [sx, sy, sz], radius: scanRadius };
+          liveCubeScanned = true;
+        }
+      }
+    }
+  } catch {
+    // Bridge unreachable — keep whatever cubeMap the client sent (procedural fallback).
+  }
   const nvidiaKey = apiKeyOverrides.nvidia || process.env.NVIDIA_API_KEY;
   const geminiKey = apiKeyOverrides.gemini || process.env.GEMINI_API_KEY;
   const nvidiaBaseUrlOverride = apiKeyOverrides.nvidiaBaseUrl || process.env.NVIDIA_BASE_URL;
@@ -1518,13 +1545,13 @@ STRICT JSON OUTPUT FORMAT:
       .join("\n");
     const targets = [...vox.filter((v: any) => /log|wood|stem/.test(v.name)), ...vox.filter((v: any) => v.isOre)]
       .sort((p: any, q: any) => dist(p) - dist(q));
-    cubeContextText = `GROUND TRUTH BLOCK MANIFEST (authoritative - these EXACT coordinates come straight from the live world scan; NEVER invent or reuse coordinates not listed here):
+    cubeContextText = `GROUND TRUTH BLOCK MANIFEST (${liveCubeScanned ? "LIVE WORLD SCAN - real server blocks read directly from the game world" : "SIMULATED SENSOR DATA - bridge offline, treat as approximate"}; these EXACT coordinates are the ONLY authoritative source of block positions; NEVER invent or reuse coordinates not listed here):
 Bot standing at: [${botPos.join(", ")}] | Scan radius: ${cubeMap.radius || 3} blocks
 Wood/Logs & Ores (nearest mining targets first): ${targets.length > 0 ? fmtList(targets, 12) : "NONE in scan range - do NOT pretend to mine anything; say so honestly in chat."}
 All non-air blocks grouped by type with real coordinates:
 ${groupCounts || "(only air detected around you)"}
 Hazard blocks (lava/fire/magma - stay away): ${vox.filter((v: any) => v.isHazard).length > 0 ? fmtList(vox.filter((v: any) => v.isHazard), 6) : "None"}
-For look_at/mine actions use the exact integer [x, y, z] above and set the matching 'block' name so aim and breaking target the RIGHT block.`;
+For look_at/mine actions use the exact integer [x, y, z] above and set the matching 'block' name so aim and breaking target the RIGHT block. The 'block' field MUST be copied verbatim from the same manifest line as the coordinates - never pair a coordinate with a different block's name.`;
   } else if (cubeSummary) {
     cubeContextText = cubeSummary;
   }
