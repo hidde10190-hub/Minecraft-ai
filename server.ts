@@ -992,13 +992,86 @@ function extractAndNormalizeAiPlan(content: string, goal: string = ""): { though
 
 // Resilient JSON Extractor for AI Responses
 function extractJsonFromContent(content: string, goal: string = ""): any {
+  // Guard against HTML error pages (e.g. "<!DOCTYPE ...") returned by API gateways when a
+  // model/endpoint is invalid - these previously crashed JSON.parse and broke the tier chain.
+  const trimmed = (content || "").trim();
+  if (!trimmed || trimmed.startsWith("<")) return null;
   const plan = extractAndNormalizeAiPlan(content, goal);
   if (plan) return plan;
   try {
-    return JSON.parse(content);
+    return JSON.parse(trimmed);
   } catch (e) {
     return null;
   }
+}
+
+// Robustly extract the player's raw chat message from an autonomy-loop chat directive.
+// Handles both the legacy rewrite format ("In-game chat message received from <Name> [Channel: x]: \"msg\"")
+// and the raw loop format ("[Channel: all]: \"msg\"" / "[TheHiddenBoy11] says: msg").
+function extractPlayerChatMessage(goal: string): string | null {
+  const g = goal || "";
+  let m = g.match(/received from\s*<?([^>\[\]":]+)>?\s*(?:\[Channel:\s*[^\]]+\])?\s*:?\s*["'“](.+?)["'”]/i);
+  if (m && m[2]) return m[2].trim();
+  m = g.match(/\[[^\]]+\]\s*says\s*:?\s*["']?(.+?)["']?$/i);
+  if (m && m[1]) return m[1].trim();
+  m = g.match(/^\[(?:Channel:[^\]]+)\]\s*:?\s*["'“](.+?)["'”]/i);
+  if (m && m[1]) return m[1].trim();
+  return null;
+}
+
+// Semantic keyword scoring for the built-in engine (no ML weights needed - neuro-symbolic lexicon).
+const BUILTIN_LEXICON = {
+  greet: ["hello", "hi ", "hey", "yo ", "good morning", "good evening", "sup", "hi!", "hello!"],
+  capabilities: ["what can you do", "capabilit", "abilities", "who are you", "help", "commands", "what do you know"],
+  presence: ["can you hear", "hear me", "are you there", "are you online", "ping"],
+  status: ["status", "where are you", "position", "coords", "coordinates", "health", "hp", "inventory", "what are you doing", "current task"],
+  stop: ["stop", "halt", "cancel", "idle", "stand down", "pause"],
+  follow: ["follow", "come here", "come to me", "walk to me", "meet me"],
+  mine: ["mine", "dig", "chop", "break", "collect", "gather", "get some"],
+  combat: ["attack", "kill", "fight", "defend", "hostile", "zombie", "skeleton", "creeper", "spider"],
+  build: ["build", "place", "construct", "portal", "wall", "tower", "house"],
+  craft: ["craft", "smelt", "furnace"],
+  thanks: ["thanks", "thank you", "thx", "ty"],
+  explore: ["explore", "scout", "look around", "scan", "survey"]
+};
+function lexiconHit(text: string, key: keyof typeof BUILTIN_LEXICON): boolean {
+  return BUILTIN_LEXICON[key].some((k) => text.includes(k));
+}
+// Block-name aliases so "oak logs" / "diamonds" resolve to real voxel names.
+const BLOCK_ALIASES: Record<string, string[]> = {
+  oak_log: ["oak log", "oak_logs", "oak wood", "oak"],
+  birch_log: ["birch log", "birch"],
+  spruce_log: ["spruce log", "spruce"],
+  jungle_log: ["jungle log", "jungle"],
+  dark_oak_log: ["dark oak"],
+  acacia_log: ["acacia"],
+  log: ["log", "logs", "wood", "timber"],
+  diamond_ore: ["diamond ore", "diamonds", "diamond"],
+  iron_ore: ["iron ore", "iron"],
+  gold_ore: ["gold ore", "gold"],
+  coal_ore: ["coal ore", "coal"],
+  copper_ore: ["copper"],
+  emerald_ore: ["emerald"],
+  stone: ["stone", "cobble", "cobblestone"],
+  dirt: ["dirt", "soil", "grass block", "grass_block"],
+  sand: ["sand"],
+  gravel: ["gravel"],
+  netherrack: ["netherrack"]
+};
+function detectBlockKeywords(text: string): string[] {
+  const hits: string[] = [];
+  for (const [block, aliases] of Object.entries(BLOCK_ALIASES)) {
+    if (aliases.some((a) => text.includes(a)) && !hits.includes(block)) hits.push(block);
+  }
+  return hits;
+}
+// Directional words -> yaw offsets for turn-toward scanning.
+function detectDirectionYaw(text: string): number | null {
+  if (/\bleft\b/.test(text)) return -90;
+  if (/\bright\b/.test(text)) return 90;
+  if (/\bbehind\b|backwards?\b/.test(text)) return 180;
+  if (/\bup\b|above/.test(text)) return 0;
+  return null;
 }
 
 // Benchmark Test Endpoint for NVIDIA API
@@ -2062,53 +2135,119 @@ function solveServerHeuristicPlan(
   const lowerGoal = (goal || "").toLowerCase();
   const latestChat = chatHistory && chatHistory.length > 0 ? chatHistory[chatHistory.length - 1] : null;
   const chatText = (typeof latestChat === "string" ? latestChat : (latestChat?.text || goal || "")).toLowerCase();
-  // Robustly extract the actual player message from a chat directive goal, if present
-  const goalChatMatch = (goal || "").match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
-  const playerMsgText = (goalChatMatch ? goalChatMatch[2] : "").toLowerCase() || chatText;
-  const isChat = lowerGoal.includes("chat") || lowerGoal.includes("say") || lowerGoal.includes("received from") || (chatHistory && chatHistory.length > 0);
+  // Robustly extract the actual player message from ANY chat-directive format used by the autonomy loop.
+  const senderMatch = (goal || "").match(/received from\s*<?([^>\[\]":]+)>?/i);
+  const senderName = senderMatch ? senderMatch[1].trim() : null;
+  const extractedMsg = extractPlayerChatMessage(goal);
+  const looksLikeChatDirective = /chat|received from|\[channel:|\bsays\b/i.test(goal || "");
+  const playerMsgText = ((extractedMsg || (looksLikeChatDirective ? "" : goal)) || chatText).toLowerCase();
+  const isChat = looksLikeChatDirective || (!!chatHistory && chatHistory.length > 0);
   const player = telemetry?.player || { x: 0, y: 64, z: 0, yaw: 0, pitch: 0 };
   const raycast = telemetry?.raycast || { type: "MISS" };
 
   const actions: any[] = [];
-  let thought = `[Built-in Neuro-Symbolic v2.7] Tactical plan for: "${goal.slice(0, 50)}" [${agentRole}].`;
+  let thought = `[Built-in Neuro-Symbolic v3.0] Tactical plan for: "${goal.slice(0, 50)}" [${agentRole}].`;
 
   // Deterministic voxel-map target lookup: pick the nearest real block matching requested keywords.
-  const voxList = Array.isArray(telemetry?.cubeMap?.voxels) ? telemetry.cubeMap.voxels.filter((v: any) => v.name && v.name !== "air") : [];
-  const wantedKeywords = ["oak_log", "birch_log", "spruce_log", "log", "wood", "diamond_ore", "iron_ore", "gold_ore", "coal_ore", "ore", "stone", "cobblestone", "dirt", "grass_block", "sand", "gravel"];
+  const voxList = Array.isArray(telemetry?.cubeMap?.voxels)
+    ? telemetry.cubeMap.voxels
+        .filter((v: any) => v && v.name && !/(^|_)air($|_)/.test(String(v.name)) && String(v.name) !== "minecraft:air")
+        .map((v: any) => ({ ...v, name: String(v.name).replace(/^minecraft:/, "") }))
+    : [];
   // Actionable chat commands (e.g. "can you mine that oak log?") must be EXECUTED, not just acknowledged:
   // evaluate mining/combat/build intent against the player's own message text as well as the raw directive.
   const combinedIntent = `${lowerGoal} ${playerMsgText}`;
-  const mentionedKw = wantedKeywords.filter((kw) => combinedIntent.includes(kw.replace("_", " ")) || combinedIntent.includes(kw));
-  const isMining = ["mine", "dig", "cobblestone", "ore", "log", "wood"].some((k) => combinedIntent.includes(k));
+  // Semantic block detection via alias lexicon ("oak logs" -> oak_log), with legacy keyword fallback.
+  const aliasBlocks = detectBlockKeywords(`${playerMsgText} ${lowerGoal}`);
+  const legacyKw = ["oak_log", "birch_log", "spruce_log", "log", "wood", "diamond_ore", "iron_ore", "gold_ore", "coal_ore", "ore", "stone", "cobblestone", "dirt", "grass_block", "sand", "gravel"]
+    .filter((kw) => combinedIntent.includes(kw.replace("_", " ")) || combinedIntent.includes(kw));
+  const mentionedKw: string[] = [...new Set([...aliasBlocks, ...legacyKw])];
+  const isMining = lexiconHit(combinedIntent, "mine") || mentionedKw.some((k) => /log|ore|stone|dirt|sand|gravel/.test(k));
+  function distTo(p: any, q: any): number {
+    return Math.hypot(Number(p.x) - Number(q.x), Number(p.y) - Number(q.y), Number(p.z) - Number(q.z));
+  }
+  // Voxel coordinates may arrive ABSOLUTE (live bridge scans) or RELATIVE to the scan center
+  // (radius offsets from older payloads). Auto-detect once per plan and normalize to absolute.
+  let voxelAbsOffset: [number, number, number] | null = null;
+  function absVoxel(v: any): { x: number; y: number; z: number } {
+    if (voxelAbsOffset === null) {
+      let maxAbs = 0;
+      for (const w of voxList) maxAbs = Math.max(maxAbs, Math.abs(Number(w.x)), Math.abs(Number(w.y)), Math.abs(Number(w.z)));
+      const playerFar = Math.max(Math.abs(Number(player.x) || 0), Math.abs(Number(player.z) || 0)) > 24;
+      // If every coordinate is within ~scan radius but the player is far from origin, the map is relative.
+      voxelAbsOffset = (maxAbs <= 16 && playerFar) ? [Math.round(Number(player.x) || 0), Math.round(Number(player.y) || 64), Math.round(Number(player.z) || 0)] : [0, 0, 0];
+    }
+    return { x: Number(v.x) + voxelAbsOffset[0], y: Number(v.y) + voxelAbsOffset[1], z: Number(v.z) + voxelAbsOffset[2] };
+  }
   function findVoxelTarget(): any | null {
     if (voxList.length === 0) return null;
     const kws = mentionedKw.length > 0 ? mentionedKw : ["log", "wood", "ore"];
     for (const kw of kws) {
       const pool = voxList.filter((v: any) => v.name.includes(kw) || kw.includes(v.name));
       if (pool.length > 0) {
-        return pool.sort((a: any, b: any) => Math.hypot(a.x - player.x, a.y - player.y, a.z - player.z) - Math.hypot(b.x - player.x, b.y - player.y, b.z - player.z))[0];
+        return pool.sort((a: any, b: any) => distTo(absVoxel(a), player) - distTo(absVoxel(b), player))[0];
       }
     }
     return null;
   }
 
-  const isCombat = ["attack", "defend", "guard", "kill", "zombie"].some((k) => combinedIntent.includes(k));
-  const isBuilding = combinedIntent.includes("build") || combinedIntent.includes("portal") || (litematicaDiff && litematicaDiff.length > 0);
+  const isCombat = lexiconHit(combinedIntent, "combat");
+  const isBuilding = lexiconHit(combinedIntent, "build") || (!!litematicaDiff && litematicaDiff.length > 0);
 
-  if (playerMsgText.includes("hear me") || playerMsgText.includes("can you hear")) {
+  // ---- Intent scoring: conversational vs actionable (built-in v3.0) ----
+  const isGreeting = lexiconHit(playerMsgText, "greet");
+  const isCapabilityQ = lexiconHit(playerMsgText, "capabilities");
+  const isPresenceQ = lexiconHit(playerMsgText, "presence");
+  const isStatusQ = lexiconHit(playerMsgText, "status");
+  const isStopCmd = lexiconHit(playerMsgText, "stop") || lowerGoal.includes("stop");
+  const isFollowCmd = lexiconHit(playerMsgText, "follow");
+  const isThanks = lexiconHit(playerMsgText, "thanks");
+  const isExploreCmd = lexiconHit(playerMsgText, "explore");
+
+  if (isPresenceQ) {
     actions.push(
       { type: "send_chat", message: `<${agentName}> Yes, I can hear you loud and clear! Ready for orders.` },
       { type: "look_at", x: player.x + 1.5, y: player.y + 1.2, z: player.z + 1.5, ticks: 3 }
     );
-  } else if (/(what can you do|capabilit|abilities|who are you|help)/.test(playerMsgText)) {
-    actions.push({ type: "send_chat", message: `<${agentName}> I am an autonomous Minecraft agent with full motor control: I can mine, build, fight, explore and follow commands. Health ${player.health ?? 20}/20 at [${Math.round(player.x)}, ${Math.round(player.y)}, ${Math.round(player.z)}]. Try: !mine wood, !follow me, !stop` });
-  } else if (playerMsgText.includes("hello") || playerMsgText.includes("hi ") || playerMsgText === "hi" || playerMsgText.includes("hey")) {
+  } else if (isCapabilityQ) {
+    // Answer truthfully from live telemetry - inventory summary included.
+    const inv = Array.isArray(telemetry?.inventory) ? telemetry.inventory : [];
+    const invSummary = inv.length > 0
+      ? inv.slice(0, 6).map((s: any) => `${String(s.item || s.id || "").replace(/^minecraft:/, "")}${s.count > 1 ? " x" + s.count : ""}`).filter(Boolean).join(", ")
+      : "";
+    const scanCount = voxList.length;
+    const nearestLogRaw = findVoxelTarget();
+    const nearestLog = nearestLogRaw ? absVoxel(nearestLogRaw) : null;
+    const worldLine = scanCount > 0
+      ? ` Sensors show ${scanCount} blocks in a ${telemetry?.cubeMap?.radius ?? 8}-block cube around me${nearestLog && nearestLogRaw ? `, nearest useful target: ${nearestLogRaw.name} at [${nearestLog.x}, ${nearestLog.y}, ${nearestLog.z}]` : ""}.`
+      : " My voxel sensors are currently empty.";
+    actions.push({
+      type: "send_chat",
+      message: `<${agentName}> I am an autonomous Minecraft agent with full motor control: I can mine, build, craft, fight, explore and follow commands.${worldLine}${invSummary ? ` Inventory: ${invSummary}.` : ""} Try: !mine wood, !follow me, !status, !stop`
+    });
+  } else if (isStatusQ && !isMining && !isCombat && !isBuilding) {
+    const hp = Math.round(Number(player.health ?? 20));
+    const food = Math.round(Number(player.food ?? 20));
+    const heldItem = String(player.heldItem?.item || player.main_hand?.item || hotbarLabel(player)).replace(/^minecraft:/, "");
+    actions.push({
+      type: "send_chat",
+      message: `<${agentName}> Status: ONLINE [${agentRole}] | Pos: [${Math.round(Number(player.x))}, ${Math.round(Number(player.y))}, ${Math.round(Number(player.z))}] | HP: ${hp}/20 | Food: ${food}/20 | Holding: ${heldItem || "nothing"} | Blocks in sensor range: ${voxList.length}`
+    });
+  } else if (isStopCmd && !isMining) {
+    actions.push({ type: "release_all_keys" }, { type: "send_chat", message: `<${agentName}> All motor activities halted. Standing by.` });
+  } else if (isGreeting && !isMining && !isCombat && !isBuilding) {
     actions.push(
-      { type: "send_chat", message: `<${agentName}> Hello! I am online and tracking your commands.` },
+      { type: "send_chat", message: `<${agentName}> Hello${senderName ? " " + senderName : ""}! I am online, my sensors are active${voxList.length > 0 ? ` and I can see ${voxList.length} blocks around me` : ""}. Give me an order: !mine wood, !follow me, !status` },
       { type: "look_at", x: player.x + 1.5, y: player.y + 1.2, z: player.z + 1.5, ticks: 3 }
     );
-  } else if (playerMsgText.includes("stop") || lowerGoal.includes("stop") || playerMsgText.includes("halt")) {
-    actions.push({ type: "release_all_keys" }, { type: "send_chat", message: `<${agentName}> All motor activities halted. Standing by.` });
+  } else if (isThanks && !isMining && !isCombat && !isBuilding) {
+    actions.push({ type: "send_chat", message: `<${agentName}> You're welcome! Standing by for further orders.` });
+  } else if (isFollowCmd && !isMining) {
+    actions.push(
+      { type: "send_chat", message: `<${agentName}> On my way - following you now.` },
+      { type: "look_at", x: Number(player.x) + 2, y: Number(player.y) + 1.2, z: Number(player.z) + 2, ticks: 4 },
+      { type: "press_key", key: "w", durationMs: 600 }
+    );
   } else if (isCombat) {
     const target = (telemetry?.nearbyEntities || [])[0];
     if (target) {
@@ -2122,52 +2261,115 @@ function solveServerHeuristicPlan(
     }
   } else if (isMining) {
     const vTarget = findVoxelTarget();
-    const targetBlock = mentionedKw[0] || (lowerGoal.includes("log") ? "log" : lowerGoal.includes("wood") ? "wood" : lowerGoal.includes("ore") ? "ore" : "");
-    const isLookingAtTarget = raycast.type === "BLOCK" && (targetBlock === "" || raycast.block?.toLowerCase().includes(targetBlock));
+    const targetBlock = mentionedKw[0] || "";
+    const isLookingAtTarget = raycast.type === "BLOCK" && (targetBlock === "" || String(raycast.block || "").toLowerCase().includes(targetBlock.split("_")[0]));
 
     if (vTarget) {
       // Ground-truth voxel map found a real matching block - mine THAT exact coordinate.
-      const dist = Math.hypot(vTarget.x - player.x, vTarget.y - player.y, vTarget.z - player.z);
-      thought += ` Voxel scan located ${vTarget.name} at [${vTarget.x}, ${vTarget.y}, ${vTarget.z}] (${dist.toFixed(1)}m).`;
-      actions.push({ type: "send_chat", message: `<${agentName}> Found ${vTarget.name} at [${vTarget.x}, ${vTarget.y}, ${vTarget.z}] - mining it now.` });
-      if (dist > 4.5) actions.push({ type: "press_key", key: "w", durationMs: 500 });
+      const abs = absVoxel(vTarget);
+      const dist = distTo(abs, player);
+      thought += ` Voxel scan located ${vTarget.name} at [${abs.x}, ${abs.y}, ${abs.z}] (${dist.toFixed(1)}m).`;
+      actions.push({ type: "send_chat", message: `<${agentName}> Found ${vTarget.name.replace(/_/g, " ")} at [${abs.x}, ${abs.y}, ${abs.z}] (${dist.toFixed(1)}m away) - mining it now.` });
+      // Smart navigation: turn toward the real block using yaw math instead of random walking.
+      const dx = Number(abs.x) + 0.5 - Number(player.x);
+      const dz = Number(abs.z) + 0.5 - Number(player.z);
+      const targetYaw = (Math.atan2(-dx, dz) * 180) / Math.PI;
+      let relYaw = ((targetYaw - Number(player.yaw ?? 0)) % 360 + 540) % 360 - 180;
+      if (Math.abs(relYaw) > 20) actions.push({ type: "look_at_relative", yaw: Math.round(relYaw), pitch: 0, ticks: 4 });
+      if (dist > 4.5) actions.push({ type: "press_key", key: "w", durationMs: Math.min(1200, Math.round(dist * 180)) }, { type: "sprint", enabled: true });
       actions.push(
-        { type: "select_hotbar", slot: /log|wood/.test(vTarget.name) ? 1 : 0 },
-        { type: "look_at", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: mcBlock(vTarget.name), ticks: 2 },
-        { type: "mine", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: mcBlock(vTarget.name), duration_ms: 2500 }
+        { type: "select_hotbar", slot: pickToolSlot(telemetry, vTarget.name) },
+        { type: "look_at", x: abs.x, y: abs.y, z: abs.z, block: mcBlock(vTarget.name), ticks: 2 },
+        { type: "mine", x: abs.x, y: abs.y, z: abs.z, block: mcBlock(vTarget.name), duration_ms: estimateMineTime(vTarget.name) }
       );
     } else if (isLookingAtTarget) {
-      const dist = Math.sqrt(Math.pow(player.x - raycast.x, 2) + Math.pow(player.y - raycast.y, 2) + Math.pow(player.z - raycast.z, 2));
+      const dist = Math.sqrt(Math.pow(Number(player.x) - Number(raycast.x), 2) + Math.pow(Number(player.y) - Number(raycast.y), 2) + Math.pow(Number(player.z) - Number(raycast.z), 2));
       if (dist > 4.5) {
         thought += ` Closing distance to target block (${dist.toFixed(1)}m).`;
         actions.push({ type: "send_chat", message: `<${agentName}> Target spotted at ${dist.toFixed(1)}m - closing distance.` }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
       } else {
         thought += ` Initiating mining cycle on ${raycast.block}.`;
-        actions.push({ type: "send_chat", message: `<${agentName}> Mining ${raycast.block} now.` }, { type: "select_hotbar", slot: 1 }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 2 }, { type: "press_key", key: "attack", durationMs: 3000 });
+        actions.push({ type: "send_chat", message: `<${agentName}> Mining ${String(raycast.block).replace(/^minecraft:/, "").replace(/_/g, " ")} now.` }, { type: "select_hotbar", slot: pickToolSlot(telemetry, String(raycast.block)) }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 2 }, { type: "press_key", key: "attack", durationMs: 3000 });
       }
     } else {
-      thought += ` Searching for ${targetBlock || "target block"}. No matching block in voxel scan range.`;
-      actions.push({ type: "send_chat", message: `<${agentName}> I don't see any ${targetBlock || "target"} within sensor range. Scanning surroundings.` }, { type: "look_at_relative", yaw: 45, pitch: 10, ticks: 8 }, { type: "press_key", key: "w", durationMs: 200 });
+      // No match in the FULL cubic scan - be honest and run a systematic 4-way sweep (not one random glance).
+      thought += ` Searching for ${targetBlock || "target block"}. No matching block in ${voxList.length}-voxel cubic scan.`;
+      actions.push(
+        { type: "send_chat", message: `<${agentName}> I scanned a full cube around me but found no ${targetBlock.replace(/_/g, " ") || "matching blocks"} yet. Running a 360° sweep to locate some.` },
+        { type: "look_at_relative", yaw: 90, pitch: 15, ticks: 6 },
+        { type: "look_at_relative", yaw: 90, pitch: 15, ticks: 6 },
+        { type: "look_at_relative", yaw: 90, pitch: 15, ticks: 6 },
+        { type: "look_at_relative", yaw: 90, pitch: 15, ticks: 6 },
+        { type: "press_key", key: "w", durationMs: 400 }
+      );
     }
   } else if (isBuilding) {
-    thought += ` Schematic diff detected. Placing construction block.`;
-    actions.push({ type: "send_chat", message: `<${agentName}> Starting construction sequence.` }, { type: "select_hotbar", slot: 0 }, { type: "look_at", x: player.x + 2, y: player.y + 1, z: player.z, ticks: 4 }, { type: "place_block", hand: "main", x: Math.floor(player.x + 2), y: Math.floor(player.y), z: Math.floor(player.z), side: "up" });
+    thought += litematicaDiff && litematicaDiff.length > 0 ? ` Schematic diff detected. Placing construction block.` : ` Construction intent detected.`;
+    actions.push({ type: "send_chat", message: `<${agentName}> Starting construction sequence.` }, { type: "select_hotbar", slot: 0 }, { type: "look_at", x: Number(player.x) + 2, y: Number(player.y) + 1, z: Number(player.z), ticks: 4 }, { type: "place_block", hand: "main", x: Math.floor(Number(player.x) + 2), y: Math.floor(Number(player.y)), z: Math.floor(Number(player.z)), side: "up" });
+  } else if (isExploreCmd && !isChat) {
+    thought += ` Autonomous exploration sweep requested.`;
+    actions.push(
+      { type: "send_chat", message: `<${agentName}> Exploring the surroundings - running a systematic survey.` },
+      { type: "look_at_relative", yaw: 120, pitch: 10, ticks: 6 },
+      { type: "press_key", key: "w", durationMs: 600 },
+      { type: "look_at_relative", yaw: -120, pitch: 10, ticks: 6 },
+      { type: "press_key", key: "w", durationMs: 600 }
+    );
   } else if (isChat) {
     // Contextual acknowledgment derived from the actual player message when available
-    const ackSource = goalChatMatch ? goalChatMatch[2] : chatText;
+    const ackSource = extractedMsg || chatText || goal;
     let ack = `Acknowledged: "${ackSource.slice(0, 60)}". Processing.`;
     if (/(follow|come here|come to me)/.test(ackSource)) ack = `Moving to your position now.`;
-    else if (/(status|where are you|position|hp|health)/.test(ackSource)) ack = `Status: ONLINE [${agentRole}]. HP: ${(player.health ?? 20)}/20 | Pos: [${Math.round(player.x)}, ${Math.round(player.y)}, ${Math.round(player.z)}]`;
+    else if (/(status|where are you|position|hp|health)/.test(ackSource)) ack = `Status: ONLINE [${agentRole}]. HP: ${(player.health ?? 20)}/20 | Pos: [${Math.round(Number(player.x))}, ${Math.round(Number(player.y))}, ${Math.round(Number(player.z))}]`;
     else if (/(thanks|thank you|thx)/.test(ackSource)) ack = `You're welcome! Standing by for further orders.`;
+    else if (/(craft|smelt)/.test(ackSource)) ack = `Crafting requires recipes I can execute via hotbar selection - tell me what item to craft next.`;
     actions.push({ type: "send_chat", message: `<${agentName}> ${ack}` });
     if (/(follow|come here)/.test(ackSource)) {
-      actions.push({ type: "look_at", x: player.x + 2, y: player.y + 1.2, z: player.z + 2, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
+      actions.push({ type: "look_at", x: Number(player.x) + 2, y: Number(player.y) + 1.2, z: Number(player.z) + 2, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
     }
   } else {
-    actions.push({ type: "look_at_relative", yaw: 15, pitch: 0, ticks: 5 }, { type: "press_key", key: "w", durationMs: 200 });
+    // Non-chat generic goal (e.g. autonomy-loop patrol objective): tactical scan sweep with honest narration.
+    const nearest = voxList.length > 0 ? voxList.slice().sort((a: any, b: any) => distTo(a, player) - distTo(b, player))[0] : null;
+    thought += nearest
+      ? ` Generic objective: nearest notable block is ${nearest.name} at [${nearest.x}, ${nearest.y}, ${nearest.z}].`
+      : ` Generic objective with empty voxel sensors - performing survey sweep.`;
+    actions.push(
+      ...(nearest ? [{ type: "look_at", x: nearest.x, y: nearest.y, z: nearest.z, block: mcBlock(nearest.name), ticks: 3 }] : [{ type: "look_at_relative", yaw: 15, pitch: 0, ticks: 5 }]),
+      { type: "look_at_relative", yaw: 90, pitch: 10, ticks: 6 },
+      { type: "press_key", key: "w", durationMs: 200 }
+    );
   }
 
   return { thought, actions };
+}
+
+// Built-in helpers: tool selection, mining duration, hotbar label fallback.
+function hotbarLabel(player: any): string {
+  const hb = Array.isArray(player?.hotbar) ? player.hotbar : [];
+  const sel = player?.selectedSlot ?? 0;
+  return hb[sel]?.item || hb[0]?.item || "";
+}
+function pickToolSlot(telemetry: any, blockName: string): number {
+  const hb = Array.isArray(telemetry?.player?.hotbar) ? telemetry.player.hotbar : [];
+  const name = String(blockName).toLowerCase();
+  const needsPickaxe = /ore|stone|cobble|iron|gold|diamond|coal|emerald|copper|obsidian|deepslate/.test(name);
+  const needsAxe = /log|wood|plank/.test(name);
+  const needsShovel = /dirt|sand|gravel|grass|clay|snow/.test(name);
+  const prefer = needsPickaxe ? ["pickaxe"] : needsAxe ? ["axe"] : needsShovel ? ["shovel"] : [];
+  for (const tool of prefer) {
+    const idx = hb.findIndex((s: any) => String(s?.item || "").toLowerCase().includes(tool));
+    if (idx >= 0) return idx;
+  }
+  return 0;
+}
+function estimateMineTime(blockName: string): number {
+  const n = String(blockName).toLowerCase();
+  if (/obsidian/.test(n)) return 9000;
+  if (/diamond|emerald/.test(n)) return 4000;
+  if (/iron|gold|stone|cobble|deepslate/.test(n)) return 3000;
+  if (/log|wood|plank/.test(n)) return 2000;
+  if (/dirt|sand|gravel|grass|snow/.test(n)) return 900;
+  return 2500;
 }
 
 function postProcessPlanWithLearning(result: any, req: any): any {

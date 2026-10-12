@@ -1,5 +1,31 @@
 [
   {
+    "id": "fail_1791809356071_24",
+    "timestamp": "2026-10-12T12:49:16.071Z",
+    "target": "diamond_ore",
+    "attemptedKey": "attack",
+    "attemptedDurationMs": 4000,
+    "requiredDurationMs": 15000,
+    "tool": "diamond_pickaxe",
+    "reason": "Attempted to mine 'diamond_ore' with 'diamond_pickaxe' for only 4000ms. The block was NOT broken! 'diamond_ore' requires at least 15000ms continuous attack key hold.",
+    "correctionAdvice": "Hold the attack key for at least 18750ms continuously. Never release early.",
+    "resolved": true,
+    "resolvedInSkillId": "skill_mine_diamond_ore"
+  },
+  {
+    "id": "fail_1791809351491_39",
+    "timestamp": "2026-10-12T12:49:11.491Z",
+    "target": "diamond_ore",
+    "attemptedKey": "attack",
+    "attemptedDurationMs": 4000,
+    "requiredDurationMs": 15000,
+    "tool": "diamond_pickaxe",
+    "reason": "Attempted to mine 'diamond_ore' with 'diamond_pickaxe' for only 4000ms. The block was NOT broken! 'diamond_ore' requires at least 15000ms continuous attack key hold.",
+    "correctionAdvice": "Hold the attack key for at least 18750ms continuously. Never release early.",
+    "resolved": true,
+    "resolvedInSkillId": "skill_mine_diamond_ore"
+  },
+  {
     "id": "fail_1791808643454_711",
     "timestamp": "2026-10-12T12:37:23.454Z",
     "target": "minecraft:diamond_ore",
