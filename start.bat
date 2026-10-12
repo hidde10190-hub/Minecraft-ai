@@ -29,7 +29,7 @@ if %ERRORLEVEL% EQU 0 (
     docker rm -f minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >nul 2>&1
     
     REM 2. Down with volumes and orphans to be absolutely sure
-    docker compose down -v --remove-orphans >nul 2>&1
+    docker compose down --remove-orphans >nul 2>&1
     
     REM 3. Kill ANY container using our ports (3000, 8080, 8079, 11434)
     for /f "tokens=*" %%i in ('docker ps -aq --filter "publish=3000" --filter "publish=8080" --filter "publish=8079" --filter "publish=11434"') do (
@@ -48,12 +48,12 @@ if %ERRORLEVEL% EQU 0 (
     set "BOT_NAME=%BOT_NAME%"
     
     echo [Status] Launching fresh containers...
-    docker compose up -d --force-recreate --remove-orphans
+    docker compose up -d --remove-orphans
     
     if %ERRORLEVEL% NEQ 0 (
         echo [Warning] Docker Compose failed. Pruning subnetted networks and retrying...
         docker network prune -f >nul 2>&1
-        docker compose up -d --force-recreate --remove-orphans
+        docker compose up -d --remove-orphans
         if !ERRORLEVEL! NEQ 0 (
             echo [Error] Docker Compose failed to start. Falling back to native...
             goto :NATIVE

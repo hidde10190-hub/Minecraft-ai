@@ -31,33 +31,28 @@ echo ""
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "[Docker Engine Detected] Starting standalone client container..."
     echo ""
-    # Aggressive Cleanup (The Nuclear Fix)
-    echo "[Status] Performing Nuclear Fix to ensure no stale containers exist..."
-    # 1. Try to stop our specific names first
-    docker stop minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >/dev/null 2>&1 || true
-    docker rm -f minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >/dev/null 2>&1 || true
-    
-    # 2. Down with volumes and orphans to be absolutely sure
-    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-    
-    # 3. Kill ANY container using our ports (3000, 8080, 8079, 11434)
-    # This is the "Nuclear" part - finding containers by published port
-    PORT_CONFLICTS=$(docker ps -aq --filter "publish=3000" --filter "publish=8080" --filter "publish=8079" --filter "publish=11434")
-    if [ ! -z "$PORT_CONFLICTS" ]; then
-        echo "[Cleanup] Stopping containers bound to ports 3000, 8080, 11434..."
-        docker stop $PORT_CONFLICTS >/dev/null 2>&1 || true
-        docker rm -f $PORT_CONFLICTS >/dev/null 2>&1 || true
+    # FAST STARTUP: the old "Nuclear Fix" ran `docker compose down -v` on every
+    # launch, which DELETED the gradle_cache / node_modules volumes -> full
+    # re-download of Minecraft + npm deps each start. It also force-recreated and
+    # killed any container publishing our ports. Now we reuse running containers
+    # and only clean up stale instances of OUR services (caches preserved).
+    echo "[Status] Checking for existing containers..."
+    RUNNING=$(docker ps -q --filter "name=minecraft-fabric-standalone" --filter "name=minecraft-ai-dashboard" | grep -c . || true)
+    if [ "${RUNNING:-0}" != "0" ]; then
+        echo "[Status] Containers already running - attaching to live logs."
+        echo "         (use 'docker compose up -d --force-recreate' to restart fresh)"
+        docker compose logs -f
+        exit 0
     fi
+    echo "[Status] Cleaning stale instances of our services (caches preserved)..."
+    docker stop minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >/dev/null 2>&1 || true
+    docker rm   minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >/dev/null 2>&1 || true
 
-    # 4. Prune exhausted subnets and stale Docker bridge networks
-    echo "[Status] Pruning unused Docker networks to prevent address pool exhaustion..."
-    docker network prune -f >/dev/null 2>&1 || true
-
-    echo "[Status] Launching fresh containers..."
-    docker compose up -d --force-recreate --remove-orphans || {
+    echo "[Status] Launching containers..."
+    docker compose up -d --remove-orphans || {
         echo "[Warning] Compose failed. Pruning networks and retrying..."
         docker network prune -f >/dev/null 2>&1 || true
-        docker compose up -d --force-recreate --remove-orphans
+        docker compose up -d --remove-orphans
     }
     echo ""
     echo "====================================================================="

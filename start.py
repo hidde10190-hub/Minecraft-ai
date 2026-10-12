@@ -60,7 +60,7 @@ def main():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root_dir)
         
         print("[Status] Launching fresh containers...")
-        subprocess.run(["docker", "compose", "up", "-d", "--force-recreate", "--remove-orphans"], cwd=root_dir)
+        subprocess.run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=root_dir)
         print("\nStreaming live container logs (Ctrl+C to detach):")
         try:
             subprocess.run(["docker", "compose", "logs", "-f"], cwd=root_dir)

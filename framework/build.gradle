@@ -84,6 +84,14 @@ loom {
             String botUser = System.getProperty("minecraft.ai.botname", System.getenv("MINECRAFT_BOT_USERNAME") ?: System.getenv("BOT_NAME") ?: "Gemini")
             programArgs "--username", botUser
             vmArg "-Dfabric.gui.disable=true"
+            // Performance: runClient previously used Java's DEFAULT heap (often <256MB),
+            // causing constant GC thrashing and in-game lag. Give the game a real heap
+            // and a low-pause collector.
+            vmArg "-Xms2G"
+            vmArg "-Xmx4G"
+            vmArg "-XX:+UseShenandoahGC"
+            vmArg "-XX:SoftMaxHeapSize=3G"
+            vmArg "-XX:+PerfDisableSharedMem"
         }
     }
 }
