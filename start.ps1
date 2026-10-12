@@ -27,7 +27,7 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         docker rm -f minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama > $null 2>&1
         
         # 2. Down with volumes
-        docker compose down -v --remove-orphans > $null 2>&1
+        docker compose down --remove-orphans > $null 2>&1
         
         # 3. Kill port conflicts
         $Conflicts = docker ps -aq --filter "publish=3000" --filter "publish=8080" --filter "publish=11434"
@@ -47,11 +47,11 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         $env:BOT_NAME = $BotName
         
         Write-Host "[Status] Launching fresh containers..." -ForegroundColor Gray
-        docker compose up -d --force-recreate --remove-orphans
+        docker compose up -d --remove-orphans
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[Warning] Compose failed. Pruning networks and retrying..." -ForegroundColor Yellow
             docker network prune -f > $null 2>&1
-            docker compose up -d --force-recreate --remove-orphans
+            docker compose up -d --remove-orphans
         }
         
         Write-Host "`n=====================================================================" -ForegroundColor Yellow

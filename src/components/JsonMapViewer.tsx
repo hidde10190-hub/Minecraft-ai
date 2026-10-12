@@ -24,7 +24,7 @@ import {
   Maximize2
 } from "lucide-react";
 import { JsonMapPayload, MapScreenshotArtifact, PlayerState, BlockCubeMap, ActionPacket } from "../types";
-import { generate3DBlockCubeMap, formatCubeMapForAiPrompt, getBlockMeta } from "../utils/cubeMapEngine";
+import { generate3DBlockCubeMap, normalizeLiveCubeMap, formatCubeMapForAiPrompt, getBlockMeta } from "../utils/cubeMapEngine";
 
 interface JsonMapViewerProps {
   player: PlayerState;
@@ -42,7 +42,7 @@ export const JsonMapViewer: React.FC<JsonMapViewerProps> = ({
   const [activeTab, setActiveTab] = useState<"3d_cube" | "area_map" | "snapshots">("3d_cube");
   
   // 3D Cube Map State
-  const [cubeRadius, setCubeRadius] = useState<number>(3); // 7x7x7
+  const [cubeRadius, setCubeRadius] = useState<number>(8); // 17x17x17 full-cube scan
   const [cubeCenter, setCubeCenter] = useState<[number, number, number]>([
     Math.round(player.x),
     Math.round(player.y),
@@ -79,15 +79,22 @@ export const JsonMapViewer: React.FC<JsonMapViewerProps> = ({
     setCubeMap(generate3DBlockCubeMap([px, py, pz], cubeRadius));
   }, [Math.round(player.x), Math.round(player.y), Math.round(player.z), cubeRadius]);
 
-  // Request real 3D Cube from Server / Minecraft Bridge
+  // Request real 3D Cube from Server / Minecraft Bridge. The bridge scans asynchronously
+  // (202 {scanning:true} handshake handled by the server proxy), and the server always
+  // returns a full cube map once one is available — normalize and display it directly.
   const handleRequestLiveCube = async () => {
     setIsFetchingLiveCube(true);
     try {
       const res = await fetch(`/api/bot/cube-map?x=${cubeCenter[0]}&y=${cubeCenter[1]}&z=${cubeCenter[2]}&radius=${cubeRadius}`);
       if (res.ok) {
         const data = await res.json();
-        if (data.voxels && Array.isArray(data.voxels)) {
-          setCubeMap(generate3DBlockCubeMap(cubeCenter, cubeRadius));
+        if (Array.isArray(data.voxels)) {
+          const normalized = normalizeLiveCubeMap(data);
+          if (normalized) {
+            setCubeMap(normalized);
+          } else {
+            setCubeMap(generate3DBlockCubeMap(cubeCenter, cubeRadius));
+          }
         }
       }
     } catch {

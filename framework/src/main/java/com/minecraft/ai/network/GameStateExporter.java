@@ -33,6 +33,9 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -208,6 +211,104 @@ public class GameStateExporter {
 
             this.server.get("/api/chat", ctx -> {
                 ctx.result(GSON.toJson(recentChatMessages));
+            });
+
+            // Real World 3D Voxel Cube Map Scan (ground-truth blocks from client world).
+            // Scans run ASYNC on the render thread with a shared result cache so HTTP requests
+            // never block Minecraft (no lag) and repeated polls are near-instant.
+            this.server.get("/api/cube-map", ctx -> {
+                Minecraft client = Minecraft.getInstance();
+                if (client.player == null || client.level == null) {
+                    JsonObject err = new JsonObject();
+                    err.addProperty("error", "Not in active game.");
+                    err.addProperty("scanning", cubeScanInProgress.get());
+                    ctx.status(503).result(GSON.toJson(err));
+                    return;
+                }
+                int radius = Math.min(16, Math.max(1, ctx.queryParamAsClass("radius", Integer.class).getOrDefault(8)));
+
+                // Always refresh the scan centered on the CURRENT player position (full cube).
+                Vec3 p = client.player.position();
+                double cx = Math.floor(p.x);
+                double cy = Math.floor(p.y);
+                double cz = Math.floor(p.z);
+
+                long now = System.currentTimeMillis();
+
+                // Serve fresh cached scan instantly (avoids re-queueing work every poll).
+                String cached = cachedCubeMapJson;
+                if (cached != null && (now - lastCubeScanAt) < CUBE_CACHE_TTL_MS
+                        && lastCubeScanRadius == radius && !cubeScanInProgress.get()) {
+                    ctx.result(cached);
+                    return;
+                }
+
+                // If a scan is already queued/running, report progress instead of stacking more.
+                if (!cubeScanInProgress.compareAndSet(false, true)) {
+                    JsonObject busy = new JsonObject();
+                    busy.addProperty("scanning", true);
+                    if (cached != null) {
+                        // Hand back the slightly-stale cache while the new one is produced.
+                        busy.addProperty("stale_cache", true);
+                        busy.addProperty("age_ms", now - lastCubeScanAt);
+                        ctx.result(withStaleFlag(cached, now - lastCubeScanAt));
+                        cubeScanInProgress.set(false);
+                        return;
+                    }
+                    ctx.status(202).result(GSON.toJson(busy));
+                    return;
+                }
+
+                final double scx = cx, scy = cy, scz = cz;
+                final int sr = radius;
+                // Queue the voxel read onto the main render thread (only place world reads are safe),
+                // then serialize off-thread. Return immediately — next poll gets the finished scan.
+                client.execute(() -> {
+                    try {
+                        Minecraft mc = Minecraft.getInstance();
+                        if (mc.player == null || mc.level == null) { cubeScanInProgress.set(false); return; }
+                        AtomicReference<String> snapshot = new AtomicReference<>();
+                        // Fast path: capture block registry keys on-thread into a flat array.
+                        int side = sr * 2 + 1;
+                        String[] names = new String[side * side * side];
+                        ClientLevel level = mc.level;
+                        int i = 0;
+                        for (int dy = sr; dy >= -sr; dy--) {
+                            for (int dz = -sr; dz <= sr; dz++) {
+                                for (int dx = -sr; dx <= sr; dx++) {
+                                    var st = level.getBlockState(new BlockPos((int) scx + dx, (int) scy + dy, (int) scz + dz));
+                                    names[i++] = BuiltInRegistries.BLOCK.getKey(st.getBlock()).toString();
+                                }
+                            }
+                        }
+                        int pcx = (int) scx, pcy = (int) scy, pcz = (int) scz;
+                        Thread.ofVirtual().start(() -> {
+                            try {
+                                String json = buildCubeMapJson(names, pcx, pcy, pcz, sr);
+                                cachedCubeMapJson = json;
+                                lastCubeScanAt = System.currentTimeMillis();
+                                lastCubeScanRadius = sr;
+                                LOGGER.info("[GameStateExporter] Live cube scan complete: center [{},{},{}] r={} ({} voxels, {}ms)",
+                                        pcx, pcy, pcz, sr, names.length, System.currentTimeMillis() - lastCubeScanAt);
+                            } catch (Exception serErr) {
+                                LOGGER.error("[GameStateExporter] Cube map serialization failed: ", serErr);
+                            } finally {
+                                cubeScanInProgress.set(false);
+                            }
+                        });
+                    } catch (Exception e) {
+                        cubeScanInProgress.set(false);
+                        LOGGER.error("[GameStateExporter] Cube scan scheduling failed: ", e);
+                    }
+                });
+
+                JsonObject ack = new JsonObject();
+                ack.addProperty("scanning", true);
+                JsonArray c = new JsonArray();
+                c.add((int) cx); c.add((int) cy); c.add((int) cz);
+                ack.add("center", c);
+                ack.addProperty("radius", sr);
+                ctx.status(202).result(GSON.toJson(ack));
             });
 
             this.server.post("/api/action", ctx -> {
@@ -394,6 +495,218 @@ public class GameStateExporter {
     /**
      * Serializes complete player, world, raycast, and nearby entity state into high-density JSON.
      */
+    /**
+     * Serializes a real-world 3D voxel cube map centered at (cx, cy, cz) with the given radius.
+     * Reads actual loaded block states from the client world - this is the ground-truth sensor
+     * used by all AI providers so they never hallucinate coordinates or block identities.
+     */
+    // ---- Async live cube-scan cache state ----
+    private static final long CUBE_CACHE_TTL_MS = 2000;
+    private static volatile String cachedCubeMapJson = null;
+    private static volatile long lastCubeScanAt = 0;
+    private static volatile int lastCubeScanRadius = -1;
+    private static final java.util.concurrent.atomic.AtomicBoolean cubeScanInProgress = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /** Injects cache-age metadata into an already-serialized cube map JSON string. */
+    private static String withStaleFlag(String json, long ageMs) {
+        try {
+            JsonObject obj = GSON.fromJson(json, JsonObject.class);
+            if (obj != null) {
+                obj.addProperty("stale_cache", true);
+                obj.addProperty("cache_age_ms", ageMs);
+                return GSON.toJson(obj);
+            }
+        } catch (Exception ignored) {}
+        return json;
+    }
+
+    /** Builds the cube-map JSON from a flat array of block registry names captured on the render thread. */
+    private String buildCubeMapJson(String[] names, int cx, int cy, int cz, int r) {
+        int side = r * 2 + 1;
+        JsonArray voxels = new JsonArray();
+        JsonArray ores = new JsonArray();
+        JsonArray hazards = new JsonArray();
+        JsonObject blockCounts = new JsonObject();
+        int solidCount = 0;
+        int airCount = 0;
+
+        int i = 0;
+        for (int dy = r; dy >= -r; dy--) {
+            for (int dz = -r; dz <= r; dz++) {
+                for (int dx = -r; dx <= r; dx++) {
+                    int x = cx + dx;
+                    int y = cy + dy;
+                    int z = cz + dz;
+                    String fullName = names[i++];
+                    if (fullName == null) continue;
+                    String cleanName = fullName.startsWith("minecraft:") ? fullName.substring(10) : fullName;
+
+                    boolean isAir = "air".equals(cleanName) || "cave_air".equals(cleanName) || "void_air".equals(cleanName);
+                    boolean isHazard = cleanName.contains("lava") || cleanName.contains("fire");
+                    boolean isOre = cleanName.contains("ore");
+                    boolean solid = !isAir && !cleanName.contains("water") && !isHazard;
+
+                    if (solid) solidCount++; else airCount++;
+                    if (!blockCounts.has(cleanName)) blockCounts.addProperty(cleanName, 0);
+                    blockCounts.addProperty(cleanName, blockCounts.get(cleanName).getAsInt() + 1);
+
+                    double dist = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
+
+                    if (!isAir) {
+                        JsonObject v = new JsonObject();
+                        v.addProperty("x", x);
+                        v.addProperty("y", y);
+                        v.addProperty("z", z);
+                        v.addProperty("name", fullName);
+                        v.addProperty("solid", solid);
+                        v.addProperty("isHazard", isHazard);
+                        v.addProperty("isOre", isOre);
+                        voxels.add(v);
+                    }
+                    if (isOre) {
+                        JsonObject o = new JsonObject();
+                        o.addProperty("name", cleanName);
+                        JsonArray posArr = new JsonArray();
+                        posArr.add(x); posArr.add(y); posArr.add(z);
+                        o.add("pos", posArr);
+                        o.addProperty("distance", Math.round(dist * 10.0) / 10.0);
+                        ores.add(o);
+                    }
+                    if (isHazard) {
+                        JsonObject h = new JsonObject();
+                        h.addProperty("name", cleanName);
+                        JsonArray posArr = new JsonArray();
+                        posArr.add(x); posArr.add(y); posArr.add(z);
+                        h.add("pos", posArr);
+                        hazards.add(h);
+                    }
+                }
+            }
+        }
+
+        JsonObject root = new JsonObject();
+        root.addProperty("source", "live_minecraft_world");
+        JsonArray center = new JsonArray();
+        center.add(cx); center.add(cy); center.add(cz);
+        root.add("center", center);
+        root.addProperty("radius", r);
+        JsonObject dims = new JsonObject();
+        dims.addProperty("width", side);
+        dims.addProperty("height", side);
+        dims.addProperty("depth", side);
+        root.add("dimensions", dims);
+        root.addProperty("totalBlocks", voxels.size());
+        root.addProperty("solidBlocks", solidCount);
+        root.addProperty("airBlocks", airCount);
+        root.addProperty("scanAgeMs", System.currentTimeMillis() - lastCubeScanAt);
+
+        JsonObject summary = new JsonObject();
+        summary.add("ores", ores);
+        summary.add("hazards", hazards);
+        summary.add("blockCounts", blockCounts);
+        summary.addProperty("densityPct", voxels.size() > 0 ? Math.round((solidCount / (float) (side * side * side)) * 100) : 0);
+        root.add("summary", summary);
+        root.add("voxels", voxels);
+        return GSON.toJson(root);
+    }
+
+    public String serializeCubeMap(Minecraft client, double cx, double cy, double cz, int radius) {
+        LocalPlayer player = client.player;
+        ClientLevel world = client.level;
+        if (player == null || world == null) return "{}";
+
+        int bx = (int) Math.floor(cx);
+        int by = (int) Math.floor(cy);
+        int bz = (int) Math.floor(cz);
+        int r = Math.min(8, Math.max(1, radius));
+
+        JsonArray voxels = new JsonArray();
+        JsonArray ores = new JsonArray();
+        JsonArray hazards = new JsonArray();
+        JsonObject blockCounts = new JsonObject();
+        int solidCount = 0;
+        int airCount = 0;
+
+        for (int dy = r; dy >= -r; dy--) {
+            for (int dz = -r; dz <= r; dz++) {
+                for (int dx = -r; dx <= r; dx++) {
+                    int x = bx + dx;
+                    int y = by + dy;
+                    int z = bz + dz;
+                    BlockPos bp = new BlockPos(x, y, z);
+                    var state = world.getBlockState(bp);
+                    String fullName = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                    String cleanName = fullName.startsWith("minecraft:") ? fullName.substring(10) : fullName;
+
+                    boolean isAir = "air".equals(cleanName) || "cave_air".equals(cleanName) || "void_air".equals(cleanName);
+                    boolean isHazard = cleanName.contains("lava") || cleanName.contains("fire");
+                    boolean isOre = cleanName.contains("ore");
+                    boolean solid = !isAir && !cleanName.contains("water") && !isHazard;
+
+                    if (solid) solidCount++; else airCount++;
+                    if (!blockCounts.has(cleanName)) blockCounts.addProperty(cleanName, 0);
+                    blockCounts.addProperty(cleanName, blockCounts.get(cleanName).getAsInt() + 1);
+
+                    double dist = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
+
+                    if (!isAir) {
+                        JsonObject v = new JsonObject();
+                        v.addProperty("x", x);
+                        v.addProperty("y", y);
+                        v.addProperty("z", z);
+                        v.addProperty("name", fullName);
+                        v.addProperty("solid", solid);
+                        v.addProperty("isHazard", isHazard);
+                        v.addProperty("isOre", isOre);
+                        voxels.add(v);
+                    }
+                    if (isOre) {
+                        JsonObject o = new JsonObject();
+                        o.addProperty("name", cleanName);
+                        JsonArray posArr = new JsonArray();
+                        posArr.add(x); posArr.add(y); posArr.add(z);
+                        o.add("pos", posArr);
+                        o.addProperty("distance", Math.round(dist * 10.0) / 10.0);
+                        ores.add(o);
+                    }
+                    if (isHazard) {
+                        JsonObject h = new JsonObject();
+                        h.addProperty("name", cleanName);
+                        JsonArray posArr = new JsonArray();
+                        posArr.add(x); posArr.add(y); posArr.add(z);
+                        h.add("pos", posArr);
+                        hazards.add(h);
+                    }
+                }
+            }
+        }
+
+        JsonObject root = new JsonObject();
+        root.addProperty("source", "live_minecraft_world");
+        JsonArray center = new JsonArray();
+        center.add(bx); center.add(by); center.add(bz);
+        root.add("center", center);
+        root.addProperty("radius", r);
+        JsonObject dims = new JsonObject();
+        int width = r * 2 + 1;
+        dims.addProperty("width", width);
+        dims.addProperty("height", width);
+        dims.addProperty("depth", width);
+        root.add("dimensions", dims);
+        root.addProperty("totalBlocks", voxels.size());
+        root.addProperty("solidBlocks", solidCount);
+        root.addProperty("airBlocks", airCount);
+
+        JsonObject summary = new JsonObject();
+        summary.add("ores", ores);
+        summary.add("hazards", hazards);
+        summary.add("blockCounts", blockCounts);
+        summary.addProperty("densityPct", voxels.size() > 0 ? Math.round((solidCount / (float) (width * width * width)) * 100) : 0);
+        root.add("summary", summary);
+        root.add("voxels", voxels);
+        return GSON.toJson(root);
+    }
+
     public String serializeTelemetry(Minecraft client) {
         if (client == null) return "{}";
         LocalPlayer player = client.player;

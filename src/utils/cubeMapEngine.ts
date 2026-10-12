@@ -143,6 +143,165 @@ export function getProceduralBlockAt(x: number, y: number, z: number, seed: numb
 }
 
 /**
+ * Normalizes a raw live-world cube map payload (from the Fabric bridge /api/cube-map or the
+ * server proxy) into the full BlockCubeMap structure used everywhere in the app. Rebuilds the
+ * derived fields (min/max, layers, summary extras) from the REAL voxels so no procedural data
+ * can leak into AI perception. Returns null if the payload is not a usable live scan.
+ */
+export function normalizeLiveCubeMap(raw: any): BlockCubeMap | null {
+  try {
+    if (!raw || !Array.isArray(raw.voxels) || raw.voxels.length === 0) return null;
+
+    const center = (Array.isArray(raw.center) ? raw.center : [0, 64, 0]).map((n: number) => Math.floor(n)) as [number, number, number];
+    const r = Math.max(1, Math.min(16, Math.floor(raw.radius ?? 8)));
+    const width = r * 2 + 1;
+
+    const voxels: VoxelBlock[] = raw.voxels.map((v: any) => {
+      const name = String(v.name).startsWith("minecraft:") ? v.name : `minecraft:${v.name}`;
+      const meta = getBlockMeta(name);
+      return {
+        x: Math.floor(v.x),
+        y: Math.floor(v.y),
+        z: Math.floor(v.z),
+        name,
+        solid: typeof v.solid === "boolean" ? v.solid : meta.solid,
+        transparent: meta.transparent,
+        hardness: meta.hardness,
+        light: meta.lightLevel,
+        isHazard: !!v.isHazard || meta.isHazard,
+        isOre: !!v.isOre || meta.isOre,
+      };
+    });
+
+    const blockCounts: Record<string, number> = {};
+    const ores: { name: string; pos: [number, number, number]; distance: number }[] = [];
+    const woodLogs: { name: string; pos: [number, number, number]; distance: number }[] = [];
+    const interactives: { name: string; pos: [number, number, number]; distance: number }[] = [];
+    const hazards: { name: string; pos: [number, number, number] }[] = [];
+    const walkableSurfaces: [number, number, number][] = [];
+    let solidCount = 0;
+    let airCount = 0;
+    let highestBlockY = -999;
+    let lowestBlockY = 999;
+
+    for (const v of voxels) {
+      const cleanName = v.name.replace(/^minecraft:/, "");
+      blockCounts[cleanName] = (blockCounts[cleanName] || 0) + 1;
+      if (v.solid) {
+        solidCount++;
+        highestBlockY = Math.max(highestBlockY, v.y);
+        lowestBlockY = Math.min(lowestBlockY, v.y);
+      } else {
+        airCount++;
+      }
+      const dx = v.x - center[0], dy = v.y - center[1], dz = v.z - center[2];
+      const dist = Math.round(Math.sqrt(dx * dx + dy * dy + dz * dz) * 10) / 10;
+      if (v.isOre) ores.push({ name: cleanName, pos: [v.x, v.y, v.z], distance: dist });
+      if (cleanName.includes("log") || cleanName.includes("wood") || cleanName.includes("stem"))
+        woodLogs.push({ name: cleanName, pos: [v.x, v.y, v.z], distance: dist });
+      if (cleanName.includes("crafting_table") || cleanName.includes("chest") || cleanName.includes("furnace") || cleanName.includes("anvil"))
+        interactives.push({ name: cleanName, pos: [v.x, v.y, v.z], distance: dist });
+      if (v.isHazard) hazards.push({ name: cleanName, pos: [v.x, v.y, v.z] });
+    }
+
+    // Walkable surface detection: air directly above a solid block within scan bounds
+    const voxelKey = (x: number, y: number, z: number) => `${x},${y},${z}`;
+    const byPos = new Map<string, VoxelBlock>();
+    for (const v of voxels) byPos.set(voxelKey(v.x, v.y, v.z), v);
+    for (const v of voxels) {
+      if (!v.solid) continue;
+      const above = byPos.get(voxelKey(v.x, v.y + 1, v.z));
+      if (above === undefined || !above.solid) {
+        // Above is either outside scan range (assume air) or non-solid → candidate stand spot
+        if (highestBlockY > -999 && Math.abs(v.y - center[1]) <= r) {
+          walkableSurfaces.push([v.x, v.y + 1, v.z]);
+        }
+      }
+    }
+
+    // Rebuild ASCII layers from real voxels
+    const layers: Record<string, string[][]> = {};
+    for (let dy = r; dy >= -r; dy--) {
+      const y = center[1] + dy;
+      const layer2D: string[][] = [];
+      for (let dz = -r; dz <= r; dz++) {
+        const row: string[] = [];
+        for (let dx = -r; dx <= r; dx++) {
+          const v = byPos.get(voxelKey(center[0] + dx, y, center[2] + dz));
+          row.push(v ? getBlockMeta(v.name).symbol : ".");
+        }
+        layer2D.push(row);
+      }
+      layers[`y${y}`] = layer2D;
+    }
+
+    ores.sort((a, b) => a.distance - b.distance);
+    woodLogs.sort((a, b) => a.distance - b.distance);
+    interactives.sort((a, b) => a.distance - b.distance);
+
+    return {
+      center,
+      radius: r,
+      dimensions: { width, height: width, depth: width },
+      min: [center[0] - r, center[1] - r, center[2] - r],
+      max: [center[0] + r, center[1] + r, center[2] + r],
+      totalBlocks: width * width * width,
+      solidBlocks: solidCount,
+      airBlocks: width * width * width - solidCount,
+      voxels,
+      summary: {
+        ores,
+        woodLogs,
+        interactives,
+        hazards,
+        walkableSurfaces: walkableSurfaces.slice(0, 24),
+        blockCounts,
+        highestBlockY: highestBlockY === -999 ? center[1] : highestBlockY,
+        lowestBlockY: lowestBlockY === 999 ? center[1] : lowestBlockY,
+        densityPct: Math.round((solidCount / (width * width * width)) * 100),
+      },
+      layers,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fetches the LIVE world cube map from the Fabric bridge via the server proxy.
+ * Falls back to procedural generation ONLY when no live game connection exists.
+ */
+export async function fetchLiveCubeMap(
+  center: [number, number, number],
+  radius: number = 8
+): Promise<{ cube: BlockCubeMap; source: "live_minecraft_world" | "procedural_fallback" }> {
+  // The server proxy already handles the bridge's async-scan handshake (202 scanning),
+  // but give it enough time to complete one full poll cycle before falling back.
+  try {
+    const controller = new AbortController();
+    const tid = setTimeout(() => controller.abort(), 6000);
+    const res = await fetch(
+      `/api/bot/cube-map?x=${Math.round(center[0])}&y=${Math.round(center[1])}&z=${Math.round(center[2])}&radius=${radius}`,
+      { signal: controller.signal }
+    );
+    clearTimeout(tid);
+    if (res.ok) {
+      const data = await res.json();
+      if (data.source === "live_minecraft_bridge" || data.source === "live_minecraft_world") {
+        const normalized = normalizeLiveCubeMap(data);
+        if (normalized) return { cube: normalized, source: "live_minecraft_world" };
+      }
+      // Server returned its own procedural map (bridge offline) — accept it but mark fallback
+      const normalized = normalizeLiveCubeMap(data);
+      if (normalized) return { cube: normalized, source: "procedural_fallback" };
+    }
+  } catch {
+    // Bridge/server unreachable — fall through to local procedural
+  }
+  return { cube: generate3DBlockCubeMap(center, radius), source: "procedural_fallback" };
+}
+
+/**
  * Generates a full 3D Cube Map of blocks centered on a position with specified radius R.
  * Size = (2R + 1) ^ 3 voxels.
  * Example: radius 2 = 5x5x5 = 125 blocks.
