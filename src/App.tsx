@@ -158,9 +158,12 @@ export default function App() {
         color,
         port,
         player: {
-          x: 100.5 + i * 2.5,
-          y: 64.0,
-          z: 20.5 + i * 2.0,
+          // Sentinel (0,0,0): NO fake coordinates. Real position comes exclusively
+          // from live bridge telemetry; UI gates on hasLivePosition to avoid showing
+          // hallucinated positions before the first packet arrives.
+          x: 0,
+          y: 0,
+          z: 0,
           yaw: 0.0,
           pitch: 10.0,
           health: 20.0,
@@ -245,9 +248,10 @@ export default function App() {
         color,
         port,
         player: {
-          x: 100.5 + i * 2.5,
-          y: 64.0,
-          z: 20.5 + i * 2.0,
+          // Sentinel (0,0,0): live telemetry will overwrite with real coords.
+          x: 0,
+          y: 0,
+          z: 0,
           yaw: 0.0,
           pitch: 10.0,
           health: 20.0,
@@ -382,6 +386,12 @@ export default function App() {
 
   const socketsRef = useRef<Map<number, WebSocket>>(new Map());
   const lastChatReplyTimeRef = useRef<number>(0);
+  // Timestamp of the most recent LIVE telemetry packet received from the Fabric bridge.
+  // Gates scans/autonomy so the AI never acts on stale or simulated coordinates.
+  const lastLiveTelemetryAtRef = useRef<number>(0);
+
+  // Fresh live position (telemetry within the last 15s) — authoritative source for scans.
+  const hasLivePosition = Date.now() - lastLiveTelemetryAtRef.current < 15000;
 
   const sendActionToBridge = (action: ActionPacket, port?: number) => {
     const targetPort = port || activeAgent?.port || 8080;
@@ -486,6 +496,8 @@ export default function App() {
               return;
             }
             if (data.player || data.inventory || data.x !== undefined || data.y !== undefined || data.z !== undefined || data.pos || data.position || data.pose) {
+              // Mark live telemetry freshness (authoritative position clock)
+              lastLiveTelemetryAtRef.current = Date.now();
               setAgents((prev) =>
                 prev.map((a) =>
                   a.port === port
@@ -594,6 +606,8 @@ export default function App() {
           if (stateRes.ok) {
             const data = await stateRes.json();
             if ((data.player || data.inventory) && !isCancelled) {
+              // Mark live telemetry freshness (authoritative position clock)
+              lastLiveTelemetryAtRef.current = Date.now();
               setPlayer(p => normalizeLivePlayerState(data, p));
               setAgents(prev => {
                 const exists = prev.find(a => a.port === activePort);
@@ -1421,13 +1435,43 @@ export default function App() {
 
       // Generate surrounding 3D Block Cube Map — LIVE world blocks when the Fabric bridge is
       // connected (real coordinates, real block identities), procedural only as offline fallback.
-      const scanCenter: [number, number, number] = [Math.round(player.x), Math.round(player.y), Math.round(player.z)];
+      // Fresh live position: refresh telemetry from the bridge right before every scan so
+      // the AI's believed coordinates can never drift from the real ones (fixes hallucinated
+      // positions like [100, 63, 103] when actually at [-305, 83, 120]).
+      let livePlayer = player;
+      try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 1500);
+        // Resolve the live bridge port via status first (no hardcoded 8080)
+        let stateUrl = "/api/bridge/state";
+        try {
+          const stStatus = await fetch("/api/bridge/status", { signal: controller.signal });
+          if (stStatus.ok) {
+            const sd = await stStatus.json();
+            if (sd && sd.connected) stateUrl = `/api/bridge/${sd.port || 8080}/state`;
+          }
+        } catch {}
+        const stRes = await fetch(stateUrl, { signal: controller.signal });
+        clearTimeout(tid);
+        if (stRes.ok) {
+          const stData = await stRes.json();
+          if (stData && (stData.player || stData.pose || stData.x !== undefined)) {
+            lastLiveTelemetryAtRef.current = Date.now();
+            livePlayer = normalizeLivePlayerState(stData, player);
+            setPlayer(() => livePlayer);
+          }
+        }
+      } catch {
+        // Bridge unreachable — fall back to last known state.
+      }
+
+      const scanCenter: [number, number, number] = [Math.round(livePlayer.x), Math.round(livePlayer.y), Math.round(livePlayer.z)];
       const { cube: currentCube, source: cubeSource } = await fetchLiveCubeMap(scanCenter, 3);
       const cubeSummary = formatCubeMapForAiPrompt(currentCube);
 
       // Unified AI Routing Strategy (NVIDIA -> Gemini -> Ollama -> Built-in)
       const payload = {
-        telemetry: { player, raycast, nearbyEntities: entities },
+        telemetry: { player: livePlayer, raycast, nearbyEntities: entities },
         goal,
         cubeMap: currentCube,
         cubeSource,
@@ -1909,9 +1953,10 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
       color: assignedColor,
       port: 8080 + nextIndex - 1,
       player: {
-        x: 100.5 + (nextIndex - 1) * 3,
+        // Sentinel (0,0,0): live telemetry will overwrite with real coords.
+        x: 0,
         y: 0,
-        z: 20.5 + (nextIndex - 1) * 2,
+        z: 0,
         yaw: 0,
         pitch: 0,
         health: 20.0,
