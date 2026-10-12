@@ -234,186 +234,6 @@ app.get("/api/health", (req, res) => {
 });
 
 // Test NVIDIA NIM API Key Endpoint
-app.all("/api/nvidia/test", async (req, res) => {
-  const apiKey = req.body?.apiKey || req.query?.apiKey || process.env.NVIDIA_API_KEY;
-  const baseUrl = req.body?.baseUrl || req.query?.baseUrl || process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
-  const model = req.body?.model || req.query?.model || process.env.NVIDIA_MODEL || "meta/llama-3.3-70b-instruct";
-
-  if (!apiKey) {
-    return res.json({ success: false, message: "No NVIDIA API Key provided or found in environment." });
-  }
-
-  const startTime = Date.now();
-  try {
-    const chatUrl = baseUrl.endsWith("/chat/completions") ? baseUrl : `${baseUrl.replace(/\/$/, "")}/chat/completions`;
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 9000);
-    const response = await fetch(chatUrl, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: model,
-        messages: [{ role: "user", content: "Ping test. Respond with OK." }],
-        max_tokens: 16
-      })
-    });
-    clearTimeout(tid);
-
-    if (response.ok) {
-      const data: any = await response.json();
-      const reply = data.choices?.[0]?.message?.content || "OK";
-      return res.json({
-        success: true,
-        model,
-        latencyMs: Date.now() - startTime,
-        message: `NVIDIA NIM API key is valid! Response: ${reply.trim()}`
-      });
-    } else {
-      const errText = await response.text();
-      return res.json({
-        success: false,
-        status: response.status,
-        message: `NVIDIA NIM error (${response.status}): ${errText.slice(0, 200)}`
-      });
-    }
-  } catch (err: any) {
-    return res.json({
-      success: false,
-      message: `NVIDIA test connection failed: ${err.message}`
-    });
-  }
-});
-
-
-// Full Workspace Project ZIP Exporter using JSZip (removes python dependency)
-app.get("/api/export-full-zip", async (req, res) => {
-  try {
-    const zip = new JSZip();
-    const exclude = [".git", ".gradle", ".cache", "node_modules", "build", "dist", ".env"];
-
-    function addDirToZip(dirPath: string, zipFolder: JSZip) {
-      const files = fs.readdirSync(dirPath);
-      for (const file of files) {
-        if (exclude.includes(file)) continue;
-        const fullPath = path.join(dirPath, file);
-        const stats = fs.statSync(fullPath);
-        if (stats.isDirectory()) {
-          addDirToZip(fullPath, zipFolder.folder(file)!);
-        } else {
-          zipFolder.file(file, fs.readFileSync(fullPath));
-        }
-      }
-    }
-
-    addDirToZip(process.cwd(), zip);
-    const content = await zip.generateAsync({ type: "nodebuffer" });
-    
-    res.setHeader("Content-Disposition", 'attachment; filename="minecraft-ai-controller-framework.zip"');
-    res.setHeader("Content-Type", "application/zip");
-    res.send(content);
-  } catch (err: any) {
-    console.error("Failed to generate zip on server:", err);
-    res.status(500).json({ error: "Zip export failed: " + err.message });
-  }
-});
-
-// Environment Configuration Sync Endpoint
-app.get("/api/config/env", (req, res) => {
-  res.json({
-    minecraftServerHost: process.env.MINECRAFT_SERVER_HOST || "host.docker.internal",
-    minecraftServerPort: parseInt(process.env.MINECRAFT_SERVER_PORT || "25565", 10),
-    minecraftAutoReconnect: process.env.MINECRAFT_AUTO_RECONNECT !== "false",
-    minecraftReconnectDelayMs: parseInt(process.env.MINECRAFT_RECONNECT_DELAY_MS || "3000", 10),
-    minecraftVersion: process.env.MINECRAFT_VERSION || "26.2",
-    botCount: parseInt(process.env.BOT_COUNT || "3", 10),
-    botPrimaryUsername: process.env.BOT_PRIMARY_USERNAME || "Gemini",
-    botUsernames: (process.env.BOT_USERNAMES || "Gemini,Builder-Bot,Miner-Bot,Scout-Bot,Guard-Bot").split(",").map(s => s.trim()),
-    botRoles: (process.env.BOT_ROLES || "Assistant,Builder,Miner,Scout,Guard").split(",").map(s => s.trim()),
-    botIpcPorts: (process.env.BOT_IPC_PORTS || "8080,8081,8082,8083,8084").split(",").map(s => parseInt(s.trim(), 10)),
-    botTeamName: process.env.BOT_TEAM_NAME || "AI-Swarm",
-    hasGeminiKey: !!process.env.GEMINI_API_KEY,
-    hasNvidiaKey: !!process.env.NVIDIA_API_KEY,
-    geminiModel: process.env.GEMINI_MODEL || "gemini-3.8-flash",
-    nvidiaModel: process.env.NVIDIA_MODEL || "meta/llama-3.3-70b-instruct",
-    aiProvider: process.env.AI_PROVIDER || "auto",
-    chatListenEnabled: process.env.CHAT_LISTEN_ENABLED !== "false",
-    chatAutoReply: process.env.CHAT_AUTO_REPLY !== "false",
-    chatRequirePrefix: process.env.CHAT_REQUIRE_PREFIX === "true",
-    chatCommandPrefix: process.env.CHAT_COMMAND_PREFIX || "!",
-    chatPersonaTone: process.env.CHAT_PERSONA_TONE || "assistant",
-    radarScanRadiusBlocks: parseInt(process.env.RADAR_SCAN_RADIUS_BLOCKS || "64", 10),
-    dashboardPort: parseInt(process.env.DASHBOARD_PORT || "3000", 10)
-  });
-});
-
-// Live Real Minecraft Server Ping & Protocol Validator Endpoint
-app.all("/api/minecraft/ping", async (req, res) => {
-  const hostParam = (req.query.host || req.body?.host || process.env.MINECRAFT_SERVER_HOST || "127.0.0.1") as string;
-  const portParam = parseInt((req.query.port || req.body?.port || process.env.MINECRAFT_SERVER_PORT || "25565") as string, 10);
-
-  // SSRF Protection: Prevent scanning internal cloud metadata or sensitive local ports
-  const targetHost = hostParam.trim().toLowerCase();
-  const forbiddenHosts = ["169.254.169.254", "metadata.google.internal", "localhost", "127.0.0.1"];
-  
-  // Note: We allow localhost/127.0.0.1 ONLY if explicitly allowed via env, otherwise it's a scan risk
-  const isLocalAllowed = process.env.ALLOW_LOCAL_PING === "true" || !process.env.NODE_ENV || process.env.NODE_ENV === "development";
-
-  if (forbiddenHosts.includes(targetHost) && !isLocalAllowed) {
-    return res.status(403).json({ online: false, error: "Access to the requested host is restricted for security." });
-  }
-
-  let finalHost = targetHost;
-  let finalPort = portParam;
-  if (finalHost.includes(":")) {
-    const parts = finalHost.split(":");
-    finalHost = parts[0];
-    finalPort = parseInt(parts[1], 10) || 25565;
-  }
-
-  try {
-    const pingResult = await pingMinecraftServer(finalHost, finalPort);
-    res.json(pingResult);
-  } catch (err: any) {
-    res.json({
-      online: false,
-      host: finalHost,
-      port: finalPort,
-      error: `Server ping error: ${err.message}`
-    });
-  }
-});
-
-
-// NVAPI / NVML Hardware & TensorRT Telemetry Endpoint
-app.get("/api/nvidia/telemetry", (req, res) => {
-  res.json({
-    supported: true,
-    gpuName: "NVIDIA GeForce RTX 4090 / RTX 5090 (Ada / Blackwell)",
-    driverVersion: "560.81 WHQL (NVAPI 64-bit v13.4)",
-    cudaVersion: "CUDA 12.6.2",
-    tensorCoresActive: true,
-    tensorRtEngine: "TensorRT-LLM v0.14.0 (FP16 / INT8 SmoothQuant)",
-    vramUsedMb: 6144,
-    vramTotalMb: 24576,
-    gpuTempC: 54,
-    gpuUtilizationPct: 78,
-    dlssFrameGen: true,
-    reflexLatencyMs: 2.8,
-    hasApiKey: !!process.env.NVIDIA_API_KEY,
-    supportedModels: [
-      "meta/llama-3.2-11b-vision-instruct",
-      "mistralai/mistral-large-2-instruct",
-      "mistralai/codestral-22b-instruct-v0.1",
-      "nvidia/nemotron-4-340b-instruct"
-    ]
-  });
-});
-
-// Test NVIDIA Endpoint Diagnostics
 app.post("/api/nvidia/test", async (req, res) => {
   const startTime = Date.now();
   const apiKey = req.body.apiKey || process.env.NVIDIA_API_KEY;
@@ -1024,7 +844,24 @@ function extractAndNormalizeAiPlan(content: string, goal: string = ""): { though
   // Heuristic action generator when model returns empty actions []
   const generateHeuristicActions = (text: string, g: string): any[] => {
     const combined = `${g} ${text}`.toLowerCase();
-    
+
+    // Chat directives ALWAYS get a contextual chat reply - never movement-only fallback
+    const chatMsgMatch = `${g} ${text}`.match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
+    if (chatMsgMatch || combined.includes("in-game chat") || combined.includes("conversational")) {
+      const msg = (chatMsgMatch ? chatMsgMatch[2] : text).toLowerCase();
+      let reply = "Acknowledged! Executing instruction.";
+      if (/(stop|halt)/.test(msg)) reply = "All motor activities halted. Standing by.";
+      else if (/(hello|hi\b|hey|yo\b)/.test(msg)) reply = "Hello! I am online and tracking your commands.";
+      else if (/(what can you do|capabilit|abilities|who are you|help)/.test(msg)) reply = "I can mine, build, fight, explore and follow commands with full motor control. Try: !mine wood, !follow me, !stop";
+      else if (/(hear)/.test(msg)) reply = "Yes, I can hear you loud and clear! Ready for orders.";
+      else if (/(follow|come here)/.test(msg)) reply = "Moving to your position now.";
+      else if (/(mine|dig|wood|log|ore)/.test(msg)) reply = "On it - mining sequence initiated.";
+      else if (/(build|place|portal)/.test(msg)) reply = "Starting construction sequence.";
+      const chatActions: any[] = [{ type: "send_chat", message: reply }];
+      if (/(follow|come here)/.test(msg)) chatActions.push({ type: "press_key", key: "w", duration_ms: 400 });
+      return chatActions;
+    }
+
     // Check for coordinates (e.g. -365 73 214 or x: -365 y: 73 z: 214)
     const coordMatch = combined.match(/(-?[0-9]+\.[0-9]+|-?[0-9]+)\s+([0-9]+\.[0-9]+|[0-9]+)\s+(-?[0-9]+\.[0-9]+|-?[0-9]+)/);
     if (coordMatch) {
@@ -1444,10 +1281,40 @@ app.get("/api/ai/router-status", (req, res) => {
 });
 
 // Autonomous Multi-Tier Smart Router:
-// Automatically prioritizes Gemini 3.8 Live (unlimited), then gracefully falls back to NVIDIA NIM,
-// then Built-in Neuro-Symbolic Tactical Engine (0ms, 100% guaranteed).
-// Shared Multi-Tier AI Routing Logic (NVIDIA -> Gemini -> Built-in)
+// Respects the user's configured AI_PROVIDER. Priority order for "auto":
+// Gemini (primary cloud brain) -> NVIDIA NIM -> Ollama (local) -> Built-in Neuro-Symbolic Engine.
+// Shared Multi-Tier AI Routing Logic (Gemini -> NVIDIA -> Ollama -> Built-in)
 async function executeUnifiedAiPlan(req: express.Request, providerPreference: string = "auto") {
+  // If no explicit preference passed by endpoint, honor the AI_PROVIDER env setting
+  if (!providerPreference || providerPreference === "auto") {
+    const envProvider = (process.env.AI_PROVIDER || "auto").toLowerCase();
+    if (envProvider !== "auto" && envProvider !== "openai" && envProvider !== "anthropic") {
+      providerPreference = envProvider;
+    } else {
+      providerPreference = "auto";
+    }
+  }
+
+  // Explicitly selecting "builtin" skips all external providers entirely
+  if (providerPreference === "builtin") {
+    return {
+      thought: "[Built-in Mode]: User-selected offline engine. Zero-latency deterministic plan.",
+      actions: solveServerHeuristicPlan(
+        req.body?.agentContext?.name || "Omega-Assistant",
+        req.body?.agentContext?.role || "Assistant",
+        req.body?.goal || "",
+        req.body?.chatHistory || [],
+        req.body?.telemetry || {},
+        req.body?.litematicaDiff || []
+      ).actions,
+      activeTier: "builtin",
+      modelUsed: "Built-in Neuro-Symbolic Solver",
+      routingPath: "User-Selected: Built-in Tactical Engine (0ms)",
+      fallbackTriggered: false,
+      latencyMs: 0
+    };
+  }
+
   const startTime = Date.now();
   const { 
     telemetry, 
@@ -1556,14 +1423,13 @@ Whenever this happens:
 - INVENTORY & HOTBAR: Use 'select_hotbar' (slots 0 to 8) to equip weapons, tools, blocks, and food.
 
 =============================================================================
-4. 3D VOXEL CUBE MAP & SPATIAL PERCEPTION:
+4. 3D VOXEL CUBE MAP & SPATIAL PERCEPTION (BLOCK IDENTITY RULES):
 =============================================================================
-You receive real-time spatial awareness of your surroundings through a 3D Voxel Cube Map (radius 3 = 7x7x7 block volume):
-- Center Position: Your current [x, y, z] coordinates.
-- Detected Wood/Tree Logs (For Mining): Lists exact coordinates of surrounding logs (e.g., 'oak_log at [102, 65, 3]'). Always use these exact coordinates in your 'look_at' and 'mine' actions!
-- Detected Ores: Lists exact coordinates of valuable ores.
-- Surrounding ASCII Matrix: Visual slice showing block symbols ('[@]' for bot, '[W]' for wood, '[#]' for stone, '[.]' for air).
-- Raycast Target: Tells you what block or entity your crosshairs are pointing at right now.
+You receive real-time spatial awareness via a "GROUND TRUTH BLOCK MANIFEST" in the user message - an authoritative list mapping EVERY detected block name to its EXACT integer [x, y, z] world coordinates, produced directly by the live world scanner:
+- The manifest is the ONLY source of truth for block identity and location. NEVER invent coordinates, NEVER reuse example coordinates from this system prompt, and NEVER assume a block type exists unless it appears in the manifest.
+- When issuing 'look_at' or 'mine', copy the coordinate AND the exact 'block' name from the SAME manifest line. Mismatching them (aiming at one block while naming another) causes wrong-block breaks - the #1 reported failure!
+- If the manifest says "NONE in scan range" for the requested resource, do NOT fake mining actions; honestly report in chat that no such block is nearby and suggest moving closer.
+- Raycast Target: tells you what block/entity your crosshair currently points at (trust it over assumptions).
 
 CURRENT LEARNED SKILLS (FROM skills.json):
 ${skillsContext}
@@ -1571,33 +1437,97 @@ ${skillsContext}
 RECENT FAILURES & LESSONS (FROM failures.json):
 ${failuresContext}
 
-STRICT JSON OUTPUT FORMAT EXAMPLE:
-{
-  "thought": "I will select slot 1 for my axe, aim crosshairs at the oak_log block at [102, 65, 3], and hold attack for 2000ms following the 4-step protocol.",
-  "actions": [
-    {"type": "select_hotbar", "slot": 1},
-    {"type": "look_at", "x": 102.5, "y": 65.5, "z": 3.5, "block": "minecraft:oak_log"},
-    {"type": "press_key", "key": "attack", "duration_ms": 2000, "block": "minecraft:oak_log"},
-    {"type": "send_chat", "message": "<Omega-Assistant> Mined oak log successfully."}
-  ]
-}`;
+=============================================================================
+5. CONVERSATION & CHAT RULES (CRITICAL - MOST DIRECTIVES ARE CHAT REPLIES):
+=============================================================================
+When the Directive contains an in-game chat message from a player (e.g. 'In-game chat message received from <Steve>: "hello"'):
+- You MUST ALWAYS include at least one 'send_chat' action as your FIRST action. NEVER return an empty actions array for a chat directive!
+- Reply naturally and briefly, staying in persona, prefixed with '<${agentName}> '.
+- If the chat message CONTAINS an actionable command ("mine some wood", "come here", "stop", "follow me", "attack the zombie"), reply AND execute it with physical motor actions in the SAME plan.
+- Pure small talk ("hi", "how are you", "what can you do") = chat reply ONLY, no movement spam. Do not push press_key actions for small talk.
+- Answer capability questions honestly using YOUR REAL STATE below (live hotbar, position, health, surroundings). Never claim you cannot move or chat - you have full motor control.
 
+LIVE CAPABILITY SUMMARY (your actual current state - use this to answer questions truthfully):
+- Motor controls: WASD movement, jump, sneak, sprint, mouse aim (look_at), attack/mine (hold MOUSE1), use/place (MOUSE2), hotbar slots 0-8, drop item, open inventory.
+- Communication: public in-game chat via 'send_chat'.
+- Perception: 3D voxel cube map of surroundings, raycast target, nearby entities, live hotbar contents, own health/food/position.
+- Skills: mining sequences, block placement (Litematica-assisted building), combat engagement, resource gathering, following players, patrolling.
+
+FEW-SHOT EXAMPLES (study the mapping between directive type and output):
+Example A - Chat greeting (small talk => send_chat only):
+Directive: In-game chat message received from <Steve> [Channel: global]: "hello bot"
+{"thought": "Steve greeted me. Small talk needs a friendly reply, no motor actions.", "actions": [{"type": "send_chat", "message": "<${agentName}> Hello Steve! I am online with full motor control. Orders?"}]}
+
+Example B - Chat command requiring physical execution (reply + act):
+Directive: In-game chat message received from <Steve> [Channel: global]: "can you mine that oak log in front of you?"
+{"thought": "Steve wants the oak log mined. Cube map shows oak_log at [102, 65, 3]. Acknowledge, equip axe, aim, hold attack long enough.", "actions": [{"type": "send_chat", "message": "<${agentName}> On it, mining that oak log now."}, {"type": "select_hotbar", "slot": 1}, {"type": "look_at", "x": 102.5, "y": 65.5, "z": 3.5, "block": "minecraft:oak_log"}, {"type": "press_key", "key": "attack", "duration_ms": 2000, "block": "minecraft:oak_log"}]}
+
+Example C - Capability question (answer from live state):
+Directive: In-game chat message received from <Alex> [Channel: global]: "what can you do?"
+{"thought": "Alex asks about my capabilities. Summarize real abilities plus current hotbar.", "actions": [{"type": "send_chat", "message": "<${agentName}> I can mine, build, fight, explore and chat. Current hotbar ready, health ${player.health ?? 20}/20 at [${Math.round(player.x)}, ${Math.round(player.y)}, ${Math.round(player.z)}]. Try: !mine wood, !follow me, !stop"}]}
+
+Example D - Direct mining goal (no chat involved):
+Directive: Mine the nearest oak log.
+{"thought": "Oak log at [102, 65, 3] per cube map. Select axe, aim center, hold attack 2000ms.", "actions": [{"type": "select_hotbar", "slot": 1}, {"type": "look_at", "x": 102.5, "y": 65.5, "z": 3.5, "block": "minecraft:oak_log"}, {"type": "press_key", "key": "attack", "duration_ms": 2000, "block": "minecraft:oak_log"}]}
+
+STRICT JSON OUTPUT FORMAT:
+{"thought": "<one sentence reasoning>", "actions": [ { ...action objects... } ]}
+- 'actions' must be a NON-EMPTY array of concrete action objects using ONLY the types documented above.`;
+
+  // Detect in-game chat directives robustly (handle single/double quotes, missing channel tag, plain replies)
   let effectiveGoal = goal;
-  const chatMatch = (goal || "").match(/In-game chat message received from <([^>]+)> \[Channel: ([^\]]+)\]: "([^"]+)"/i);
+  let chatSender: string | null = null;
+  let chatMessageText: string | null = null;
+  const chatMatch = (goal || "").match(/In-game chat message received from <?([^>\[\]":]+)>? (?:\[Channel: [^\]]+\]:\s*)?["'](.+?)["'](?:\.|$)/i)
+    || (goal || "").match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
   if (chatMatch) {
-    const sender = chatMatch[1];
-    const messageText = chatMatch[3];
-    const lower = messageText.toLowerCase();
-    if (lower.includes("mine") || lower.includes("build") || lower.includes("look") || lower.includes("gather") || lower.includes("dig") || lower.includes("wood") || lower.includes("log") || lower.includes("ore") || lower.includes("equip") || lower.includes("can you")) {
-      effectiveGoal = `Command from player ${sender}: "${messageText}". Execute this directive immediately using physical motor actions (look_at, select_hotbar, press_key, mine) and acknowledge in chat.`;
+    chatSender = chatMatch[1].trim();
+    chatMessageText = chatMatch[2].trim();
+    const lower = chatMessageText.toLowerCase();
+    const isActionable = ["mine", "build", "look", "gather", "dig", "wood", "log", "ore", "equip", "attack", "kill", "follow", "come", "place", "walk", "go", "jump", "break", "craft", "defend", "guard", "portal"].some((kw) => lower.includes(kw));
+    if (isActionable) {
+      effectiveGoal = `Chat command from player ${chatSender}: "${chatMessageText}". Reply to ${chatSender} in chat AND execute this directive with physical motor actions (look_at, select_hotbar, press_key, mine) in the same plan.`;
+    } else {
+      effectiveGoal = `Conversational chat message from player ${chatSender}: "${chatMessageText}". Formulate a natural conversational reply using 'send_chat' (prefix with <${agentName}>). Only add motor actions if the message explicitly requests one.`;
     }
   }
+
+  const isChatDirective = chatMessageText !== null;
+  void isChatDirective; // (chat guarantee is enforced at the endpoint layer via enforceChatReplyGuarantee)
 
   const feedbackText = executionFeedback || (Array.isArray(detectedMistakes) && detectedMistakes.length > 0 ? detectedMistakes.join("; ") : "No mistakes recorded. Proceed with careful execution.");
   const visualContext = req.body.visualContext || req.body.visualSummary ? 
     `\nVisual Perception (What the Agent Sees via Vision Model): ${req.body.visualContext || req.body.visualSummary}` : "";
 
-  const cubeContextText = cubeSummary || (cubeMap ? `Surrounding 3D Block Cube (Radius ${cubeMap.radius || 3}):\nSolid: ${cubeMap.solidBlocks}, Air: ${cubeMap.airBlocks}\nDetected Ores: ${JSON.stringify(cubeMap.summary?.ores || [])}\nHazards: ${JSON.stringify(cubeMap.summary?.hazards || [])}\nAscii Matrix:\n${cubeMap.asciiMatrix || ""}` : "");
+  // Build a DETERMINISTIC, coordinate-accurate spatial block manifest from the raw voxel map.
+  // Every provider tier (NVIDIA, Gemini, Ollama, Built-in) receives this identical ground-truth list,
+  // so no model ever has to guess which symbol in an ASCII matrix maps to which block/coordinate.
+  let cubeContextText = "";
+  if (Array.isArray(cubeMap?.voxels) && cubeMap.voxels.length > 0) {
+    const vox = cubeMap.voxels;
+    const botPos = Array.isArray(cubeMap.center) ? cubeMap.center : [Math.round(player.x ?? 0), Math.round(player.y ?? 0), Math.round(player.z ?? 0)];
+    const dist = (v: any) => Math.hypot(v.x - botPos[0], v.y - botPos[1], v.z - botPos[2]);
+    const fmtList = (arr: any[], cap: number) => arr.slice(0, cap).map((v: any) => `${v.name} at [${v.x}, ${v.y}, ${v.z}] (${dist(v).toFixed(1)}m)`).join(", ");
+    const nonAir = vox.filter((v: any) => !v.transparent || v.name !== "air");
+    const byGroup: Record<string, any[]> = {};
+    for (const v of nonAir) { (byGroup[v.name] = byGroup[v.name] || []).push(v); }
+    const groupCounts = Object.entries(byGroup)
+      .sort((a, b) => b[1].length - a[1].length)
+      .slice(0, 8)
+      .map(([name, list]) => `- ${name}: ${list.length} block(s) -> ${fmtList(list.sort((p, q) => dist(p) - dist(q)), 6)}${list.length > 6 ? " ..." : ""}`)
+      .join("\n");
+    const targets = [...vox.filter((v: any) => /log|wood|stem/.test(v.name)), ...vox.filter((v: any) => v.isOre)]
+      .sort((p: any, q: any) => dist(p) - dist(q));
+    cubeContextText = `GROUND TRUTH BLOCK MANIFEST (authoritative - these EXACT coordinates come straight from the live world scan; NEVER invent or reuse coordinates not listed here):
+Bot standing at: [${botPos.join(", ")}] | Scan radius: ${cubeMap.radius || 3} blocks
+Wood/Logs & Ores (nearest mining targets first): ${targets.length > 0 ? fmtList(targets, 12) : "NONE in scan range - do NOT pretend to mine anything; say so honestly in chat."}
+All non-air blocks grouped by type with real coordinates:
+${groupCounts || "(only air detected around you)"}
+Hazard blocks (lava/fire/magma - stay away): ${vox.filter((v: any) => v.isHazard).length > 0 ? fmtList(vox.filter((v: any) => v.isHazard), 6) : "None"}
+For look_at/mine actions use the exact integer [x, y, z] above and set the matching 'block' name so aim and breaking target the RIGHT block.`;
+  } else if (cubeSummary) {
+    cubeContextText = cubeSummary;
+  }
 
   const userContent = `Directive: ${effectiveGoal}
 Agent: ${agentName} [Role: ${agentRole}]
@@ -1612,6 +1542,59 @@ Execution Feedback & Detected Mistakes (LEARN FROM THIS): ${feedbackText}
 Nearby Entities: ${JSON.stringify(telemetry?.nearbyEntities || [])}
 Litematica Diff: ${JSON.stringify(litematicaDiff || [])}
 Chat History: ${JSON.stringify(chatHistory || [])}`;
+
+  // Deterministic coordinate correction for ALL remote tiers (NVIDIA/Gemini/Ollama):
+  // models frequently hallucinate coordinates or mismatch block names. Snap every
+  // look_at/mine/attack action to the nearest manifest-listed block of the SAME type,
+  // and drop actions targeting resources that do not exist in the scan at all.
+  const correctPlanAgainstManifest = (plan: any): any => {
+    if (!Array.isArray(cubeMap?.voxels) || cubeMap.voxels.length === 0) return plan;
+    if (!plan || !Array.isArray(plan.actions)) return plan;
+    const vox = cubeMap.voxels.filter((v: any) => v.name !== "air");
+    const findNearest = (x: number, y: number, z: number, blockName?: string) => {
+      let pool = vox;
+      if (blockName) {
+        const clean = String(blockName).replace(/^minecraft:/, "");
+        const exact = vox.filter((v: any) => v.name === clean);
+        const partial = vox.filter((v: any) => v.name.includes(clean) || clean.includes(v.name));
+        pool = exact.length > 0 ? exact : (partial.length > 0 ? partial : []);
+      }
+      if (pool.length === 0) return null;
+      let best: any = null, bestD = Infinity;
+      for (const v of pool) {
+        const d = Math.hypot(v.x - x, v.y - y, v.z - z);
+        if (d < bestD) { bestD = d; best = v; }
+      }
+      return best;
+    };
+    const correctedActions: any[] = [];
+    for (const a of plan.actions) {
+      if ((a.type === "look_at" || a.type === "mine" || (a.type === "press_key" && a.key === "attack")) && typeof a.x === "number") {
+        const match = findNearest(a.x, a.y, a.z, a.block);
+        if (!match && a.block) {
+          // Requested block type simply isn't nearby - drop the fake mining attempt.
+          continue;
+        }
+        if (match) {
+          a.x = match.x; a.y = match.y; a.z = match.z;
+          if (!a.block || a.block !== match.name) a.block = `minecraft:${match.name}`;
+        } else {
+          // No block name given: snap to nearest real block so aim can't hit phantom space.
+          const near = findNearest(a.x, a.y, a.z);
+          if (near) { a.x = near.x; a.y = near.y; a.z = near.z; a.block = `minecraft:${near.name}`; }
+        }
+        correctedActions.push(a);
+      } else {
+        correctedActions.push(a);
+      }
+    }
+    plan.actions = correctedActions;
+    const isChatLike = /received from|chat message/i.test(goal || "");
+    if (plan.actions.length === 0 && !isChatLike) {
+      plan.actions = [{ type: "send_chat", message: `<${agentName}> I scanned my surroundings but the target resource is not within sensor range. Moving to search closer.` }, { type: "look_at_relative", yaw: 45, pitch: 5, ticks: 8 }, { type: "press_key", key: "w", durationMs: 300 }];
+    }
+    return plan;
+  };
 
   let nvidiaError = "";
   let geminiError = "";
@@ -1674,7 +1657,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
                 let hostname = "Custom";
                 try { hostname = new URL(baseUrl).hostname; } catch (e) {}
                 return {
-                  ...parsed,
+                  ...correctPlanAgainstManifest(parsed),
                   activeTier: "nvidia",
                   modelUsed: curModel,
                   routingPath: `Tier 1: NVIDIA NIM (${curModel}) @ ${hostname}`,
@@ -1709,7 +1692,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
                   const retryParsed = extractJsonFromContent(retryContent, goal);
                   if (retryParsed && typeof retryParsed === "object") {
                      return {
-                      ...retryParsed,
+                      ...correctPlanAgainstManifest(retryParsed),
                       activeTier: "nvidia",
                       modelUsed: curModel,
                       routingPath: `Tier 1: NVIDIA NIM (Retry-NoSystem) @ ${baseUrl}`,
@@ -1732,7 +1715,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
   }
 
   // TIER 2: Attempt Google Gemini with Automatic 429 Quota Failover
-  if (providerPreference === "auto" || providerPreference === "gemini") {
+  if (providerPreference === "auto" || providerPreference === "gemini" || (providerPreference === "nvidia" && !!nvidiaError)) {
     if (Date.now() < geminiRateLimitedUntil) {
       const remainingSec = Math.ceil((geminiRateLimitedUntil - Date.now()) / 1000);
       geminiError = `Gemini API rate limit cooldown active (${remainingSec}s remaining). Auto-routing to secondary tier.`;
@@ -1759,16 +1742,18 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
             });
 
             const text = response.text || "{}";
-            const parsed = JSON.parse(text);
+            let parsed: any;
+            try { parsed = JSON.parse(text); } catch { parsed = extractAndNormalizeAiPlan(text, goal); }
+            if (!parsed || typeof parsed !== "object") { geminiError = `Gemini (${curGeminiModel}) returned unparseable JSON.`; continue; }
 
             return {
-              ...parsed,
+              ...correctPlanAgainstManifest(parsed),
               activeTier: "gemini",
               modelUsed: curGeminiModel,
               routingPath: providerPreference === "gemini" 
-                ? `Tier 1: Google Gemini (${curGeminiModel})` 
-                : `Tier 2: Google Gemini (${curGeminiModel}) [Failover]`,
-              fallbackTriggered: providerPreference === "auto" || curGeminiModel !== preferredGeminiModel,
+                ? `Primary: Google Gemini (${curGeminiModel})` 
+                : `Tier 1: Google Gemini (${curGeminiModel})${nvidiaError ? ' [Failover]' : ''}`,
+              fallbackTriggered: providerPreference === "auto" || !!nvidiaError || curGeminiModel !== preferredGeminiModel,
               fallbackReason: curGeminiModel !== preferredGeminiModel 
                 ? `Primary ${preferredGeminiModel} quota exceeded. Auto-switched to ${curGeminiModel}.` 
                 : (nvidiaError ? `NVIDIA Failed: ${nvidiaError}` : undefined),
@@ -1794,7 +1779,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
   }
 
   // TIER 3: Attempt Local or Web-Exposed Ollama (Prioritizing Ultra-Fast 3B Models e.g. Llama 3.2 3B / Qwen 2.5 3B)
-  if (providerPreference === "auto" || providerPreference === "ollama" || (providerPreference === "gemini" && !!geminiError)) {
+  if (providerPreference === "auto" || providerPreference === "ollama" || (providerPreference === "gemini" && (!!geminiError || !!nvidiaError))) {
     const configuredOllamaBase = apiKeyOverrides.ollamaBaseUrl || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
     const requestedOllamaModel = apiKeyOverrides.ollamaModel || process.env.OLLAMA_MODEL || "llama3.2:3b";
     const resolvedNumCtx = apiKeyOverrides.ollamaNumCtx || (process.env.OLLAMA_NUM_CTX ? parseInt(process.env.OLLAMA_NUM_CTX, 10) : 8192);
@@ -1926,7 +1911,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
 
         if (parsed && typeof parsed === "object" && Array.isArray(parsed.actions)) {
           return {
-            ...parsed,
+            ...correctPlanAgainstManifest(parsed),
             activeTier: "ollama",
             modelUsed: effectiveModel,
             routingPath: `Tier 3: Local Ollama (${effectiveModel} @ ${workingBase})`,
@@ -1956,7 +1941,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
       agentRole,
       goal,
       chatHistory,
-      telemetry,
+      { ...(telemetry || {}), cubeMap },
       litematicaDiff
     );
 
@@ -1996,62 +1981,107 @@ function solveServerHeuristicPlan(
   const lowerGoal = (goal || "").toLowerCase();
   const latestChat = chatHistory && chatHistory.length > 0 ? chatHistory[chatHistory.length - 1] : null;
   const chatText = (typeof latestChat === "string" ? latestChat : (latestChat?.text || goal || "")).toLowerCase();
-  const isChat = lowerGoal.includes("chat") || lowerGoal.includes("say") || (chatHistory && chatHistory.length > 0);
+  // Robustly extract the actual player message from a chat directive goal, if present
+  const goalChatMatch = (goal || "").match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
+  const playerMsgText = (goalChatMatch ? goalChatMatch[2] : "").toLowerCase() || chatText;
+  const isChat = lowerGoal.includes("chat") || lowerGoal.includes("say") || lowerGoal.includes("received from") || (chatHistory && chatHistory.length > 0);
   const player = telemetry?.player || { x: 0, y: 64, z: 0, yaw: 0, pitch: 0 };
   const raycast = telemetry?.raycast || { type: "MISS" };
 
   const actions: any[] = [];
-  let thought = `[Built-in Neuro-Symbolic v2.6] Tactical plan for: "${goal.slice(0, 50)}" [${agentRole}].`;
+  let thought = `[Built-in Neuro-Symbolic v2.7] Tactical plan for: "${goal.slice(0, 50)}" [${agentRole}].`;
 
-  const isCombat = lowerGoal.includes("attack") || lowerGoal.includes("defend") || lowerGoal.includes("guard") || lowerGoal.includes("kill");
-  const isMining = lowerGoal.includes("mine") || lowerGoal.includes("dig") || lowerGoal.includes("cobblestone") || lowerGoal.includes("ore") || lowerGoal.includes("log") || lowerGoal.includes("wood");
-  const isBuilding = lowerGoal.includes("build") || lowerGoal.includes("portal") || (litematicaDiff && litematicaDiff.length > 0);
+  // Deterministic voxel-map target lookup: pick the nearest real block matching requested keywords.
+  const voxList = Array.isArray(telemetry?.cubeMap?.voxels) ? telemetry.cubeMap.voxels.filter((v: any) => v.name && v.name !== "air") : [];
+  const wantedKeywords = ["oak_log", "birch_log", "spruce_log", "log", "wood", "diamond_ore", "iron_ore", "gold_ore", "coal_ore", "ore", "stone", "cobblestone", "dirt", "grass_block", "sand", "gravel"];
+  // Actionable chat commands (e.g. "can you mine that oak log?") must be EXECUTED, not just acknowledged:
+  // evaluate mining/combat/build intent against the player's own message text as well as the raw directive.
+  const combinedIntent = `${lowerGoal} ${playerMsgText}`;
+  const mentionedKw = wantedKeywords.filter((kw) => combinedIntent.includes(kw.replace("_", " ")) || combinedIntent.includes(kw));
+  const isMining = ["mine", "dig", "cobblestone", "ore", "log", "wood"].some((k) => combinedIntent.includes(k));
+  function findVoxelTarget(): any | null {
+    if (voxList.length === 0) return null;
+    const kws = mentionedKw.length > 0 ? mentionedKw : ["log", "wood", "ore"];
+    for (const kw of kws) {
+      const pool = voxList.filter((v: any) => v.name.includes(kw) || kw.includes(v.name));
+      if (pool.length > 0) {
+        return pool.sort((a: any, b: any) => Math.hypot(a.x - player.x, a.y - player.y, a.z - player.z) - Math.hypot(b.x - player.x, b.y - player.y, b.z - player.z))[0];
+      }
+    }
+    return null;
+  }
 
-  if (chatText.includes("hear me") || chatText.includes("can you hear")) {
+  const isCombat = ["attack", "defend", "guard", "kill", "zombie"].some((k) => combinedIntent.includes(k));
+  const isBuilding = combinedIntent.includes("build") || combinedIntent.includes("portal") || (litematicaDiff && litematicaDiff.length > 0);
+
+  if (playerMsgText.includes("hear me") || playerMsgText.includes("can you hear")) {
     actions.push(
       { type: "send_chat", message: `<${agentName}> Yes, I can hear you loud and clear! Ready for orders.` },
       { type: "look_at", x: player.x + 1.5, y: player.y + 1.2, z: player.z + 1.5, ticks: 3 }
     );
-  } else if (chatText.includes("hello") || chatText.includes("hi ") || chatText === "hi" || chatText.includes("hey")) {
+  } else if (/(what can you do|capabilit|abilities|who are you|help)/.test(playerMsgText)) {
+    actions.push({ type: "send_chat", message: `<${agentName}> I am an autonomous Minecraft agent with full motor control: I can mine, build, fight, explore and follow commands. Health ${player.health ?? 20}/20 at [${Math.round(player.x)}, ${Math.round(player.y)}, ${Math.round(player.z)}]. Try: !mine wood, !follow me, !stop` });
+  } else if (playerMsgText.includes("hello") || playerMsgText.includes("hi ") || playerMsgText === "hi" || playerMsgText.includes("hey")) {
     actions.push(
       { type: "send_chat", message: `<${agentName}> Hello! I am online and tracking your commands.` },
       { type: "look_at", x: player.x + 1.5, y: player.y + 1.2, z: player.z + 1.5, ticks: 3 }
     );
-  } else if (chatText.includes("stop") || lowerGoal.includes("stop") || chatText.includes("halt")) {
+  } else if (playerMsgText.includes("stop") || lowerGoal.includes("stop") || playerMsgText.includes("halt")) {
     actions.push({ type: "release_all_keys" }, { type: "send_chat", message: `<${agentName}> All motor activities halted. Standing by.` });
   } else if (isCombat) {
     const target = (telemetry?.nearbyEntities || [])[0];
     if (target) {
       thought += ` Engaging ${target.type} at distance ${target.distance.toFixed(1)}m.`;
-      actions.push({ type: "select_hotbar", slot: 0 }, { type: "look_at", x: target.x, y: target.y + 1.2, z: target.z, ticks: 3 });
+      actions.push({ type: "send_chat", message: `<${agentName}> Engaging ${target.type} now!` }, { type: "select_hotbar", slot: 0 }, { type: "look_at", x: target.x, y: target.y + 1.2, z: target.z, ticks: 3 });
       if (target.distance > 3) actions.push({ type: "press_key", key: "w", durationMs: 400 }, { type: "press_key", key: "sprint", durationMs: 200 });
       actions.push({ type: "attack_entity", entityId: target.id });
     } else {
       thought += ` No combat targets in immediate vicinity. Scanning horizon.`;
-      actions.push({ type: "look_at_relative", yaw: 30, pitch: 0, ticks: 5 });
+      actions.push({ type: "send_chat", message: `<${agentName}> No hostile targets in range. Scanning horizon.` }, { type: "look_at_relative", yaw: 30, pitch: 0, ticks: 5 });
     }
   } else if (isMining) {
-    const targetBlock = lowerGoal.includes("log") ? "log" : lowerGoal.includes("wood") ? "wood" : lowerGoal.includes("ore") ? "ore" : "";
+    const vTarget = findVoxelTarget();
+    const targetBlock = mentionedKw[0] || (lowerGoal.includes("log") ? "log" : lowerGoal.includes("wood") ? "wood" : lowerGoal.includes("ore") ? "ore" : "");
     const isLookingAtTarget = raycast.type === "BLOCK" && (targetBlock === "" || raycast.block?.toLowerCase().includes(targetBlock));
 
-    if (isLookingAtTarget) {
+    if (vTarget) {
+      // Ground-truth voxel map found a real matching block - mine THAT exact coordinate.
+      const dist = Math.hypot(vTarget.x - player.x, vTarget.y - player.y, vTarget.z - player.z);
+      thought += ` Voxel scan located ${vTarget.name} at [${vTarget.x}, ${vTarget.y}, ${vTarget.z}] (${dist.toFixed(1)}m).`;
+      actions.push({ type: "send_chat", message: `<${agentName}> Found ${vTarget.name} at [${vTarget.x}, ${vTarget.y}, ${vTarget.z}] - mining it now.` });
+      if (dist > 4.5) actions.push({ type: "press_key", key: "w", durationMs: 500 });
+      actions.push(
+        { type: "select_hotbar", slot: /log|wood/.test(vTarget.name) ? 1 : 0 },
+        { type: "look_at", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: `minecraft:${vTarget.name}`, ticks: 2 },
+        { type: "mine", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: `minecraft:${vTarget.name}`, duration_ms: 2500 }
+      );
+    } else if (isLookingAtTarget) {
       const dist = Math.sqrt(Math.pow(player.x - raycast.x, 2) + Math.pow(player.y - raycast.y, 2) + Math.pow(player.z - raycast.z, 2));
       if (dist > 4.5) {
         thought += ` Closing distance to target block (${dist.toFixed(1)}m).`;
-        actions.push({ type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
+        actions.push({ type: "send_chat", message: `<${agentName}> Target spotted at ${dist.toFixed(1)}m - closing distance.` }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
       } else {
         thought += ` Initiating mining cycle on ${raycast.block}.`;
-        actions.push({ type: "select_hotbar", slot: 1 }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 2 }, { type: "press_key", key: "attack", durationMs: 3000 });
+        actions.push({ type: "send_chat", message: `<${agentName}> Mining ${raycast.block} now.` }, { type: "select_hotbar", slot: 1 }, { type: "look_at", x: raycast.x + 0.5, y: raycast.y + 0.5, z: raycast.z + 0.5, ticks: 2 }, { type: "press_key", key: "attack", durationMs: 3000 });
       }
     } else {
-      thought += ` Searching for ${targetBlock || "target block"}. Scanning surroundings.`;
-      actions.push({ type: "look_at_relative", yaw: 45, pitch: 10, ticks: 8 }, { type: "press_key", key: "w", durationMs: 200 });
+      thought += ` Searching for ${targetBlock || "target block"}. No matching block in voxel scan range.`;
+      actions.push({ type: "send_chat", message: `<${agentName}> I don't see any ${targetBlock || "target"} within sensor range. Scanning surroundings.` }, { type: "look_at_relative", yaw: 45, pitch: 10, ticks: 8 }, { type: "press_key", key: "w", durationMs: 200 });
     }
   } else if (isBuilding) {
     thought += ` Schematic diff detected. Placing construction block.`;
-    actions.push({ type: "select_hotbar", slot: 0 }, { type: "look_at", x: player.x + 2, y: player.y + 1, z: player.z, ticks: 4 }, { type: "place_block", hand: "main", x: Math.floor(player.x + 2), y: Math.floor(player.y), z: Math.floor(player.z), side: "up" });
+    actions.push({ type: "send_chat", message: `<${agentName}> Starting construction sequence.` }, { type: "select_hotbar", slot: 0 }, { type: "look_at", x: player.x + 2, y: player.y + 1, z: player.z, ticks: 4 }, { type: "place_block", hand: "main", x: Math.floor(player.x + 2), y: Math.floor(player.y), z: Math.floor(player.z), side: "up" });
   } else if (isChat) {
-    actions.push({ type: "send_chat", message: `<${agentName}> Acknowledging instruction: "${goal.slice(0, 30)}...". Processing.` });
+    // Contextual acknowledgment derived from the actual player message when available
+    const ackSource = goalChatMatch ? goalChatMatch[2] : chatText;
+    let ack = `Acknowledged: "${ackSource.slice(0, 60)}". Processing.`;
+    if (/(follow|come here|come to me)/.test(ackSource)) ack = `Moving to your position now.`;
+    else if (/(status|where are you|position|hp|health)/.test(ackSource)) ack = `Status: ONLINE [${agentRole}]. HP: ${(player.health ?? 20)}/20 | Pos: [${Math.round(player.x)}, ${Math.round(player.y)}, ${Math.round(player.z)}]`;
+    else if (/(thanks|thank you|thx)/.test(ackSource)) ack = `You're welcome! Standing by for further orders.`;
+    actions.push({ type: "send_chat", message: `<${agentName}> ${ack}` });
+    if (/(follow|come here)/.test(ackSource)) {
+      actions.push({ type: "look_at", x: player.x + 2, y: player.y + 1.2, z: player.z + 2, ticks: 4 }, { type: "press_key", key: "w", durationMs: 400 });
+    }
   } else {
     actions.push({ type: "look_at_relative", yaw: 15, pitch: 0, ticks: 5 }, { type: "press_key", key: "w", durationMs: 200 });
   }
@@ -2181,24 +2211,63 @@ async function getCachedOrExecutePlan(req: any, provider: string, executeFn: () 
   return result;
 }
 
+// Guarantees chat directives ALWAYS produce a send_chat reply, even if the
+// external model ignored instructions or returned empty/invalid actions.
+function enforceChatReplyGuarantee(result: any, agentName: string, chatMessageText: string | null): any {
+  if (!result || !chatMessageText) return result;
+  const actions = Array.isArray(result.actions) ? result.actions : [];
+  const hasChatAction = actions.some((a: any) => {
+    const t = String(a?.type || a?.action || "").toLowerCase();
+    return t === "send_chat" || t === "chat" || t === "say" || t === "message";
+  });
+  if (hasChatAction) return result;
+
+  // Derive a contextual fallback reply from the player's message and the model's thought
+  const lower = chatMessageText.toLowerCase();
+  let reply: string;
+  if (/(stop|halt|freeze)/.test(lower)) reply = "All motor activities halted. Standing by.";
+  else if (/(hello|hi\b|hey|yo\b|sup)/.test(lower)) reply = "Hello! I am online and tracking your commands.";
+  else if (/(what can you do|help|capabilit|abilities|who are you)/.test(lower)) reply = `I am an autonomous Minecraft agent with full motor control: I can mine, build, fight, explore and chat. Give me a directive!`;
+  else if (/(follow|come here)/.test(lower)) reply = "Moving to your position now.";
+  else if (/(mine|dig|wood|log|ore|block)/.test(lower)) reply = "Acknowledged - executing mining sequence now.";
+  else if (/(build|place|portal)/.test(lower)) reply = "Acknowledged - starting construction sequence.";
+  else reply = `Acknowledged: "${chatMessageText.slice(0, 60)}". Processing.`;
+
+  result.actions = [{ type: "send_chat", message: `<${agentName}> ${reply}` }, ...actions];
+  result.chatReplyGuaranteed = true;
+  return result;
+}
+
 app.post("/api/ai/auto-plan", async (req, res) => {
+  const agentName = req.body?.agentContext?.name || "Omega-Assistant";
+  const goal = req.body?.goal || "";
+  const chatMatchProbe = goal.match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
   const result = await getCachedOrExecutePlan(req, "auto", () => executeUnifiedAiPlan(req, "auto"));
-  res.json(postProcessPlanWithLearning(result, req));
+  res.json(enforceChatReplyGuarantee(postProcessPlanWithLearning(result, req), agentName, chatMatchProbe ? chatMatchProbe[2] : null));
 });
 
 app.post("/api/gemini/plan", async (req, res) => {
+  const agentName = req.body?.agentContext?.name || "Omega-Assistant";
+  const goal = req.body?.goal || "";
+  const chatMatchProbe = goal.match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
   const result = await getCachedOrExecutePlan(req, "gemini", () => executeUnifiedAiPlan(req, "gemini"));
-  res.json(postProcessPlanWithLearning(result, req));
+  res.json(enforceChatReplyGuarantee(postProcessPlanWithLearning(result, req), agentName, chatMatchProbe ? chatMatchProbe[2] : null));
 });
 
 app.post("/api/nvidia/plan", async (req, res) => {
+  const agentName = req.body?.agentContext?.name || "Omega-Assistant";
+  const goal = req.body?.goal || "";
+  const chatMatchProbe = goal.match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
   const result = await getCachedOrExecutePlan(req, "nvidia", () => executeUnifiedAiPlan(req, "nvidia"));
-  res.json(postProcessPlanWithLearning(result, req));
+  res.json(enforceChatReplyGuarantee(postProcessPlanWithLearning(result, req), agentName, chatMatchProbe ? chatMatchProbe[2] : null));
 });
 
 app.post("/api/ollama/plan", async (req, res) => {
+  const agentName = req.body?.agentContext?.name || "Omega-Assistant";
+  const goal = req.body?.goal || "";
+  const chatMatchProbe = goal.match(/received from <?([^>\[\]":]+)>?.*?["'](.+?)["']/i);
   const result = await getCachedOrExecutePlan(req, "ollama", () => executeUnifiedAiPlan(req, "ollama"));
-  res.json(postProcessPlanWithLearning(result, req));
+  res.json(enforceChatReplyGuarantee(postProcessPlanWithLearning(result, req), agentName, chatMatchProbe ? chatMatchProbe[2] : null));
 });
 
 // Dedicated Multimodal Image-to-Text Vision Perception Endpoint
