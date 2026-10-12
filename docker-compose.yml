@@ -31,10 +31,12 @@ services:
       - MINECRAFT_BOT_USERNAME=${MINECRAFT_BOT_USERNAME:-${BOT_NAME:-Gemini}}
       - AI_IPC_PORT=8080
       # JAVA_TOOL_OPTIONS applies to EVERY JVM in the container (Gradle daemon AND the
-      # game client), so it must stay modest: 4G max. The game's own heap is tuned
-      # separately in framework/build.gradle (loom runs). Larger values here previously
-      # made the Gradle daemon hoard RAM, starving the client and causing in-game lag.
-      - JAVA_TOOL_OPTIONS=-Xmx4G -Xms512M -Dfabric.gui.disable=true -XX:+UseG1GC -XX:+PerfDisableSharedMem
+      # game client). Do NOT put a GC flag (-XX:+UseG1GC etc.) here: the game client
+      # also selects its own GC via vmArg in framework/build.gradle, and the JVM aborts
+      # with "Multiple garbage collectors selected" when both are present. The client's
+      # build.gradle already passes -Xms/-Xmx/GC flags itself, so this env var only
+      # needs to cap the Gradle daemon's heap.
+      - JAVA_TOOL_OPTIONS=-Xmx4G -Xms512M -Dfabric.gui.disable=true -XX:+PerfDisableSharedMem
     # Resources: sized for a smooth client. NOTE: on Docker Desktop (Windows/Mac) these
     # limits only help if the WSL2/VM total allocation in Docker Settings is raised too
     # (recommended: 16GB RAM / 8 CPUs for the Docker VM).

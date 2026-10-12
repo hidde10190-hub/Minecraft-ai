@@ -89,8 +89,8 @@ loom {
             // and a low-pause collector.
             vmArg "-Xms2G"
             vmArg "-Xmx4G"
-            vmArg "-XX:+UseShenandoahGC"
-            vmArg "-XX:SoftMaxHeapSize=3G"
+            vmArg "-XX:+UseG1GC"
+            vmArg "-XX:MaxGCPauseMillis=200"
             vmArg "-XX:+PerfDisableSharedMem"
         }
     }
