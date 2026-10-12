@@ -1291,7 +1291,7 @@ export default function App() {
         return { ...p, hotbar: newHotbar };
       });
     } else if (action.type === "request_cube_map" || action.type === "scan_3d_cube") {
-      const r = action.radius || 3;
+      const r = action.radius || 8;
       const centerPos: [number, number, number] = action.center || [Math.round(player.x), Math.round(player.y), Math.round(player.z)];
       fetchLiveCubeMap(centerPos, r).then(({ cube, source }) => {
         setThoughtLog((prev) => [
@@ -1466,7 +1466,7 @@ export default function App() {
       }
 
       const scanCenter: [number, number, number] = [Math.round(livePlayer.x), Math.round(livePlayer.y), Math.round(livePlayer.z)];
-      const { cube: currentCube, source: cubeSource } = await fetchLiveCubeMap(scanCenter, 3);
+      const { cube: currentCube, source: cubeSource } = await fetchLiveCubeMap(scanCenter, 8);
       const cubeSummary = formatCubeMapForAiPrompt(currentCube);
 
       // Unified AI Routing Strategy (NVIDIA -> Gemini -> Ollama -> Built-in)

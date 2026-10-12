@@ -153,7 +153,7 @@ export function normalizeLiveCubeMap(raw: any): BlockCubeMap | null {
     if (!raw || !Array.isArray(raw.voxels) || raw.voxels.length === 0) return null;
 
     const center = (Array.isArray(raw.center) ? raw.center : [0, 64, 0]).map((n: number) => Math.floor(n)) as [number, number, number];
-    const r = Math.max(1, Math.min(10, Math.floor(raw.radius ?? 3)));
+    const r = Math.max(1, Math.min(16, Math.floor(raw.radius ?? 8)));
     const width = r * 2 + 1;
 
     const voxels: VoxelBlock[] = raw.voxels.map((v: any) => {
@@ -273,11 +273,13 @@ export function normalizeLiveCubeMap(raw: any): BlockCubeMap | null {
  */
 export async function fetchLiveCubeMap(
   center: [number, number, number],
-  radius: number = 3
+  radius: number = 8
 ): Promise<{ cube: BlockCubeMap; source: "live_minecraft_world" | "procedural_fallback" }> {
+  // The server proxy already handles the bridge's async-scan handshake (202 scanning),
+  // but give it enough time to complete one full poll cycle before falling back.
   try {
     const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 2500);
+    const tid = setTimeout(() => controller.abort(), 6000);
     const res = await fetch(
       `/api/bot/cube-map?x=${Math.round(center[0])}&y=${Math.round(center[1])}&z=${Math.round(center[2])}&radius=${radius}`,
       { signal: controller.signal }

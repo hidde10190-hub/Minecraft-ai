@@ -1,5 +1,19 @@
 [
   {
+    "id": "skill_mine_minecraft_diamond_ore",
+    "name": "Mine MINECRAFT:DIAMOND_ORE",
+    "category": "mining",
+    "target": "minecraft:diamond_ore",
+    "tool": "air",
+    "requiredDurationMs": 15000,
+    "recommendedDurationMs": 18750,
+    "key": "attack",
+    "description": "Self-Learned Fix: 'minecraft:diamond_ore' requires holding attack continuously for >= 15000ms (recommended 18750ms). Short press (2500ms) failed to break the block!",
+    "rule": "Hold attack for 18750ms when mining minecraft:diamond_ore.",
+    "learnedFromMistake": true,
+    "updatedAt": "2026-10-12T12:37:23.454Z"
+  },
+  {
     "id": "skill_mine_oak_log",
     "name": "Mine OAK_LOG",
     "category": "mining",

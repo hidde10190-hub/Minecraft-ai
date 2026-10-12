@@ -1149,24 +1149,52 @@ function getProceduralServerBlock(x: number, y: number, z: number): string {
   return iy < 0 ? "minecraft:deepslate" : "minecraft:stone";
 }
 
+// Normalizes any block name to exactly one "minecraft:" namespace prefix (prevents
+// "minecraft:minecraft:x" double-prefixing from mixed data sources).
+function mcBlock(name: any): string {
+  const n = String(name || "");
+  if (!n) return n;
+  return n.startsWith("minecraft:") ? n : `minecraft:${n}`;
+}
+
+// Last good live cube map captured by the server (real-world ground truth). Reused briefly
+// when the bridge is mid-scan so plans never fall back to simulated terrain while in-game.
+let lastGoodLiveCubeMap: any = null;
+let lastGoodLiveCubeAt = 0;
+
 // 3D Block Cube Map Query Endpoint (Real Bridge Proxy + Procedural Solver)
 app.all(["/api/bot/cube-map", "/api/bridge/:port/cube-map"], async (req, res) => {
   const reqPort = req.params?.port || "8080";
   const cx = parseFloat((req.query.x || req.body?.x || 100) as string);
   const cy = parseFloat((req.query.y || req.body?.y || 64) as string);
   const cz = parseFloat((req.query.z || req.body?.z || 20) as string);
-  const radius = Math.min(8, Math.max(1, parseInt((req.query.radius || req.body?.radius || "3") as string, 10)));
+  const radius = Math.min(16, Math.max(1, parseInt((req.query.radius || req.body?.radius || "8") as string, 10)));
 
-  // Try fetching live blocks from Fabric Bridge / Mineflayer
+  // Try fetching live blocks from Fabric Bridge / Mineflayer (async scan handshake:
+  // 202 {scanning:true} means a fresh scan is running on the client render thread —
+  // poll a few times with short backoff instead of immediately serving fake data).
   try {
     const base = await getWorkingBridgeBase(reqPort);
-    const controller = new AbortController();
-    const tid = setTimeout(() => controller.abort(), 1800);
-    const bridgeRes = await fetch(`${base}/api/cube-map?x=${cx}&y=${cy}&z=${cz}&radius=${radius}`, { signal: controller.signal });
-    clearTimeout(tid);
-    if (bridgeRes.ok) {
-      const liveCube = await bridgeRes.json();
-      return res.json({ source: "live_minecraft_bridge", ...liveCube });
+    const deadline = Date.now() + 3000;
+    while (base && Date.now() < deadline) {
+      const controller = new AbortController();
+      const tid = setTimeout(() => controller.abort(), 1500);
+      let bridgeRes: Response | null = null;
+      try {
+        bridgeRes = await fetch(`${base}/api/cube-map?x=${cx}&y=${cy}&z=${cz}&radius=${radius}`, { signal: controller.signal });
+      } finally {
+        clearTimeout(tid);
+      }
+      if (!bridgeRes) break;
+      const liveCube: any = await bridgeRes.json().catch(() => null);
+      if (liveCube && String(liveCube.source || "").includes("live") && Array.isArray(liveCube.voxels)) {
+        return res.json({ source: "live_minecraft_bridge", ...liveCube });
+      }
+      if (bridgeRes.status === 202 || (liveCube && liveCube.scanning)) {
+        await new Promise((r) => setTimeout(r, 250));
+        continue;
+      }
+      break;
     }
   } catch {}
 
@@ -1338,24 +1366,49 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
   // directly from the Fabric bridge's real world. This makes coordinate ground truth identical
   // for every provider tier (NVIDIA/Gemini/Ollama/Built-in) and immune to stale or procedurally
   // simulated maps arriving from any client path.
+  // The bridge scans ASYNC (returns 202 {scanning:true} while a fresh scan runs on the render
+  // thread), so we poll briefly with a short backoff and fall back to the last good live cache
+  // instead of ever serving procedural blocks when the bot is actually in-world.
   let cubeMap: any = cubeMapFromBody;
   let liveCubeScanned = false;
   try {
     const pl = telemetry?.player || {};
     const sx = Math.round(pl.x ?? 0), sy = Math.round(pl.y ?? 64), sz = Math.round(pl.z ?? 0);
-    const scanRadius = Math.min(8, Math.max(1, parseInt(String(cubeMap?.radius ?? 3), 10) || 3));
+    const scanRadius = Math.min(16, Math.max(1, parseInt(String(cubeMap?.radius ?? 8), 10) || 8));
     const base = await getWorkingBridgeBase("8080");
     if (base) {
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), 2500);
-      const bridgeRes = await fetch(`${base}/api/cube-map?x=${sx}&y=${sy}&z=${sz}&radius=${scanRadius}`, { signal: controller.signal });
-      clearTimeout(tid);
-      if (bridgeRes.ok) {
-        const liveData: any = await bridgeRes.json();
-        if (liveData && Array.isArray(liveData.voxels) && liveData.voxels.length >= 0 && String(liveData.source || "").includes("live")) {
+      const deadline = Date.now() + 3500;
+      while (Date.now() < deadline) {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 2000);
+        let bridgeRes: Response | null = null;
+        try {
+          bridgeRes = await fetch(`${base}/api/cube-map?x=${sx}&y=${sy}&z=${sz}&radius=${scanRadius}`, { signal: controller.signal });
+        } finally {
+          clearTimeout(tid);
+        }
+        if (!bridgeRes) break;
+        const status = bridgeRes.status;
+        const liveData: any = await bridgeRes.json().catch(() => null);
+        if (liveData && String(liveData.source || "").includes("live") && Array.isArray(liveData.voxels)) {
           cubeMap = { ...liveData, center: liveData.center || [sx, sy, sz], radius: scanRadius };
           liveCubeScanned = true;
+          lastGoodLiveCubeMap = cubeMap;
+          lastGoodLiveCubeAt = Date.now();
+          break;
         }
+        if (status === 202 || (liveData && liveData.scanning)) {
+          // Scan queued/running on the client — brief wait, then poll again.
+          await new Promise((r) => setTimeout(r, 300));
+          continue;
+        }
+        break; // unexpected payload shape — stop polling
+      }
+      // If still no fresh scan but the bridge produced one recently, reuse the last good live
+      // map (real-world coordinates) rather than falling back to simulated terrain.
+      if (!liveCubeScanned && lastGoodLiveCubeMap && Date.now() - lastGoodLiveCubeAt < 20000) {
+        cubeMap = lastGoodLiveCubeMap;
+        liveCubeScanned = true;
       }
     }
   } catch {
@@ -1605,11 +1658,11 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
         }
         if (match) {
           a.x = match.x; a.y = match.y; a.z = match.z;
-          if (!a.block || a.block !== match.name) a.block = `minecraft:${match.name}`;
+          if (!a.block || mcBlock(a.block) !== mcBlock(match.name)) a.block = mcBlock(match.name);
         } else {
           // No block name given: snap to nearest real block so aim can't hit phantom space.
           const near = findNearest(a.x, a.y, a.z);
-          if (near) { a.x = near.x; a.y = near.y; a.z = near.z; a.block = `minecraft:${near.name}`; }
+          if (near) { a.x = near.x; a.y = near.y; a.z = near.z; a.block = mcBlock(near.name); }
         }
         correctedActions.push(a);
       } else {
@@ -2080,8 +2133,8 @@ function solveServerHeuristicPlan(
       if (dist > 4.5) actions.push({ type: "press_key", key: "w", durationMs: 500 });
       actions.push(
         { type: "select_hotbar", slot: /log|wood/.test(vTarget.name) ? 1 : 0 },
-        { type: "look_at", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: `minecraft:${vTarget.name}`, ticks: 2 },
-        { type: "mine", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: `minecraft:${vTarget.name}`, duration_ms: 2500 }
+        { type: "look_at", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: mcBlock(vTarget.name), ticks: 2 },
+        { type: "mine", x: vTarget.x, y: vTarget.y, z: vTarget.z, block: mcBlock(vTarget.name), duration_ms: 2500 }
       );
     } else if (isLookingAtTarget) {
       const dist = Math.sqrt(Math.pow(player.x - raycast.x, 2) + Math.pow(player.y - raycast.y, 2) + Math.pow(player.z - raycast.z, 2));
