@@ -23,7 +23,7 @@ if (fs.existsSync(".env")) {
 }
 
 const app = express();
-const PORT = 3000;
+const PORT = parseInt(process.env.PORT || "3000", 10);
 
 app.use(express.json());
 
@@ -1326,7 +1326,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
     detectedMistakes,
     chatHistory, 
     agentContext,
-    cubeMap,
+    cubeMap: cubeMapFromBody,
     cubeSummary,
     apiKeyOverrides = {}
   } = req.body;
@@ -1338,6 +1338,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
   // directly from the Fabric bridge's real world. This makes coordinate ground truth identical
   // for every provider tier (NVIDIA/Gemini/Ollama/Built-in) and immune to stale or procedurally
   // simulated maps arriving from any client path.
+  let cubeMap: any = cubeMapFromBody;
   let liveCubeScanned = false;
   try {
     const pl = telemetry?.player || {};
