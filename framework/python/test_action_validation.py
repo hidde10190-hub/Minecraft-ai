@@ -31,6 +31,10 @@ class ActionValidationTests(unittest.TestCase):
         with self.assertRaises(ActionValidationError):
             validate_action({"type": "select_hotbar", "slot": 9})
 
+    def test_accepts_controller_movement_keys(self):
+        for key in ("w", "a", "s", "d", "space", "shift", "attack", "use"):
+            self.assertEqual(validate_action({"type": "press_key", "key": key})["key"], key)
+
     def test_rejects_unapproved_key(self):
         with self.assertRaises(ActionValidationError):
             validate_action({"type": "press_key", "key": "delete_world"})
