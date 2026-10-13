@@ -19,6 +19,7 @@ import aiohttp
 import requests
 import websockets
 
+from action_validation import ActionValidationError, validate_action, validate_plan_actions
 from memory_engine import MemoryEngine
 
 
@@ -278,13 +279,18 @@ class MinecraftAiOrchestrator:
                     memory_summary,
                     diff
                 )
+                # Validate the entire model response before sending any action. This prevents
+                # a malformed later action from leaving a partially executed plan.
+                actions = validate_plan_actions(plan.get("actions", []))
                 print(f"[AI Thought]: {plan.get('thought')}")
 
-                for action in plan.get("actions", []):
+                for action in actions:
                     await self.dispatch_action(action)
                     self.memory.record_step(self.latest_telemetry, action, "dispatched")
                     await asyncio.sleep(0.05)
 
+            except ActionValidationError as e:
+                print(f"[Orchestrator] Rejected unsafe/malformed action plan: {e}")
             except Exception as e:
                 print(f"[Orchestrator] Error during cognitive step: {e}")
 
@@ -295,6 +301,8 @@ class MinecraftAiOrchestrator:
         if not self.ws:
             return
 
+        # Revalidate at the execution boundary too, including non-LLM callers.
+        validate_action(action)
         action_type = action.get("type")
         if action_type == "save_landmark":
             self.memory.save_landmark(action["name"], action["x"], action["y"], action["z"], action.get("description", ""))
