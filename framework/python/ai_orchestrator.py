@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -21,6 +22,29 @@ import websockets
 
 from action_validation import ActionValidationError, validate_action, validate_plan_actions
 from memory_engine import MemoryEngine
+
+
+def _load_config_env() -> None:
+    """Load root config.env for direct runs; existing process variables take priority."""
+    config_path = Path(__file__).resolve().parents[2] / "config.env"
+    if not config_path.is_file():
+        return  # Docker Compose may already have loaded env_file into the process.
+    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if not key or not key.replace("_", "").isalnum():
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("\\\"", "'"):
+            value = value[1:-1]
+        else:
+            value = value.split(" #", 1)[0].rstrip()
+        os.environ.setdefault(key, value)
+
+
+_load_config_env()
 
 
 SYSTEM_PROMPT = """You are an Autonomous Minecraft AI Agent controlling a player character via the Minecraft-AI-Bridge Fabric Mod.
@@ -453,8 +477,16 @@ class MinecraftAiOrchestrator:
 # CLI Entry Point
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minecraft-AI-Bridge Python AI Orchestrator")
-    parser.add_argument("--provider", choices=["ollama", "gemini", "openai", "anthropic"], default="ollama", help="LLM Provider")
-    parser.add_argument("--model", default="llama3:latest", help="Model name or tag")
+    supported_providers = sorted(set(ModelAdapter.OPENAI_COMPATIBLE_DEFAULTS) | {"ollama", "gemini", "openai", "anthropic"})
+    parser.add_argument(
+        "--provider", choices=supported_providers,
+        default=os.environ.get("AI_PROVIDER", "ollama").strip().lower(),
+        help="LLM provider (defaults to AI_PROVIDER in config.env)",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model ID/tag (defaults to the selected provider's *_MODEL setting)",
+    )
     parser.add_argument("--host", default="localhost", help="Minecraft Java Mod Bridge host")
     parser.add_argument("--port", type=int, default=8080, help="Minecraft Java Mod Bridge port")
     parser.add_argument("--goal", default="Build the active Litematica schematic", help="Initial agent goal")
@@ -467,7 +499,7 @@ if __name__ == "__main__":
 
     print("=" * 65)
     print("  MINECRAFT-AI-BRIDGE: AUTONOMOUS AGENT ORCHESTRATOR")
-    print(f"  Provider: {args.provider} | Model: {args.model}")
+    print(f"  Provider: {adapter.provider} | Model: {adapter.model_name}")
     print(f"  Bridge Target: ws://{args.host}:{args.port}/ws")
     print(f"  Primary Goal: {args.goal}")
     print("=" * 65)
