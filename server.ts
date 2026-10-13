@@ -3,6 +3,7 @@ import path from "path";
 import net from "net";
 import fs from "fs";
 import os from "os";
+import http from "http";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
 import dotenv from "dotenv";
@@ -23,6 +24,29 @@ if (fs.existsSync(".env")) {
 
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
+
+// -----------------------------------------------------------------------------
+// ROOT-CAUSE FIX FOR "ERR_EMPTY_RESPONSE / stuck loading":
+// This file is TypeScript. It previously contained `import type { Duplex } ...`
+// and other TS-only syntax at TOP LEVEL. When Node runs dist/server.cjs directly
+// (or tsx fails over to plain `node server.ts`), Node >=20.6 type-strips the file;
+// type-stripping ABORTS on any TS-only syntax it cannot erase inline — and
+// `import type` statements are explicitly unsupported by Node's stripper. The
+// process then crashed immediately after printing the listen banner, leaving the
+// port open just long enough for TCP connect but with zero HTTP bytes returned:
+// exactly "localhost heeft geen gegevens verzonden / ERR_EMPTY_RESPONSE".
+// All TS-only constructs below have been removed or moved inside function bodies
+// where esbuild erases them during bundling.
+// -----------------------------------------------------------------------------
+
+// Last-resort crash reporter: if anything throws AFTER startup, log loudly
+// instead of silently killing the process (which manifests as empty responses).
+process.on("uncaughtException", (err) => {
+  console.error("[Minecraft-AI-Bridge] Uncaught exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[Minecraft-AI-Bridge] Unhandled rejection:", reason);
+});
 
 // Raise the JSON body limit: plan payloads carry a full 3D voxel cube map (up to ~5k voxels),
 // which easily exceeds express.json()'s default 100kb and produced PayloadTooLargeError ->
@@ -1271,17 +1295,12 @@ app.get("/api/bridge/status", async (req, res) => {
 // routes never see upgrade requests, and the previous route-level http-proxy.ws()
 // call passed an OutgoingMessage instead of a net.Socket, throwing
 // "TypeError: socket.setNoDelay is not a function" and breaking the live telemetry
-// pipe (dashboard stuck loading). We use Node's built-in WebSocket client (Node 22+)
-// to tunnel frames between the browser socket and the Fabric bridge - zero deps.
-import * as http from "http";
-import type { Duplex } from "stream";
-
-interface WsTunnelClient {
-  socket: Duplex;
-  buffer: Buffer;
-  cleanup: () => void;
-}
-const wsTunnels = new Map<string, Set<WsTunnelClient>>();
+// pipe (dashboard stuck loading). We tunnel raw TCP bytes between the browser
+// socket and the Fabric bridge - zero deps.
+//
+// NOTE ON SYNTAX: no `import type` / other Node-stripper-unsupported constructs
+// may appear at top level here (see root-cause comment at the top of this file).
+const wsTunnels = new Map();
 
 function closeTunnelsForPort(port: string) {
   const set = wsTunnels.get(port);
@@ -1293,10 +1312,12 @@ function closeTunnelsForPort(port: string) {
   wsTunnels.delete(port);
 }
 
-// ---- Minimal RFC6455 frame helpers (zero deps, works on Node 18+) ----
-function wsEncodeFrame(payload: Buffer, opcode: number): Buffer {
+// Raw-socket WebSocket helpers (frame encode/decode) kept for the clean-close
+// path below. All TS-only syntax lives inside function bodies where esbuild
+// erases it during bundling.
+function wsEncodeFrame(payload, opcode) {
   const len = payload.length;
-  let header: Buffer;
+  let header;
   if (len < 126) {
     header = Buffer.allocUnsafe(2);
     header[1] = len;
@@ -1313,148 +1334,23 @@ function wsEncodeFrame(payload: Buffer, opcode: number): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-// Incrementally decode frames from a growing buffer. Returns leftover bytes.
-function wsDecodeFrames(buf: Buffer, onFrame: (opcode: number, payload: Buffer) => void): Buffer {
-  let pos = 0;
-  while (buf.length - pos >= 2) {
-    const opcode = buf[pos] & 0x0f;
-    const masked = (buf[pos + 1] & 0x80) !== 0;
-    let len = buf[pos + 1] & 0x7f;
-    let off = pos + 2;
-    if (len === 126) {
-      if (buf.length - off < 2) break;
-      len = buf.readUInt16BE(off); off += 2;
-    } else if (len === 127) {
-      if (buf.length - off < 8) break;
-      len = Number(buf.readBigUInt64BE(off)); off += 8;
-    }
-    let maskKey: Buffer | null = null;
-    if (masked) {
-      if (buf.length - off < 4) break;
-      maskKey = buf.subarray(off, off + 4); off += 4;
-    }
-    if (buf.length - off < len) break;
-    const payload = Buffer.from(buf.subarray(off, off + len));
-    if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
-    off += len;
-    pos = off;
-    onFrame(opcode, payload);
-  }
-  return buf.subarray(pos);
-}
-
-interface UpstreamWsConn {
-  socket: Duplex;
-  ready: boolean;
-  closed: boolean;
-  sendText: (s: string) => void;
-  sendBinary: (b: Buffer) => void;
-  close: () => void;
-  onOpen: (cb: () => void) => void;
-  onFrame: (cb: (opcode: number, payload: Buffer) => void) => void;
-  onClose: (cb: () => void) => void;
-}
-
-// Raw-socket WebSocket client: performs the opening handshake and parses frames.
-// Replaces global WebSocket (unavailable on Node < 21 / needs flags on 20).
-function connectUpstreamWs(urlStr: string, timeoutMs = 4000): Promise<UpstreamWsConn> {
-  return new Promise((resolve, reject) => {
-    const u = new URL(urlStr);
-    const portNum = parseInt(u.port || "80", 10);
-    const sock: any = net.connect(portNum, u.hostname);
-    const openCbs: Array<() => void> = [];
-    const frameCbs: Array<(op: number, p: Buffer) => void> = [];
-    const closeCbs: Array<() => void> = [];
-    const conn: UpstreamWsConn = {
-      socket: sock,
-      ready: false,
-      closed: false,
-      sendText: (s) => { try { sock.write(wsEncodeFrame(Buffer.from(s, "utf8"), 0x1)); } catch {} },
-      sendBinary: (b) => { try { sock.write(wsEncodeFrame(b, 0x2)); } catch {} },
-      close: () => {
-        if (conn.closed) return;
-        conn.closed = true;
-        try { sock.write(wsEncodeFrame(Buffer.alloc(0), 0x8)); sock.end(); } catch { try { sock.destroy(); } catch {} }
-      },
-      onOpen: (cb) => { openCbs.push(cb); },
-      onFrame: (cb) => { frameCbs.push(cb); },
-      onClose: (cb) => { closeCbs.push(cb); },
-    };
-
-    const key = require("crypto").randomBytes(16).toString("base64");
-    let handshaken = false;
-    let accBuf: Buffer = Buffer.alloc(0);
-    let resolved = false;
-
-    const timer = setTimeout(() => {
-      if (!resolved) { try { sock.destroy(); } catch {}; reject(new Error("upstream WS handshake timeout")); }
-    }, timeoutMs);
-
-    sock.on("connect", () => {
-      sock.write(
-        `GET ${u.pathname || "/"} HTTP/1.1\r\nHost: ${u.hostname}:${portNum}\r\n` +
-        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
-        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
-      );
-    });
-    sock.on("data", (chunk: Buffer) => {
-      if (!handshaken) {
-        accBuf = Buffer.concat([accBuf, chunk]);
-        const idx = accBuf.indexOf("\r\n\r\n");
-        if (idx === -1) return;
-        const headStr = accBuf.subarray(0, idx).toString();
-        if (!/^HTTP\/1\.1 101/.test(headStr.split("\r\n")[0])) {
-          clearTimeout(timer);
-          try { sock.destroy(); } catch {}
-          reject(new Error(`bridge refused upgrade: ${headStr.split("\r\n")[0]}`));
-          return;
-        }
-        handshaken = true;
-        conn.ready = true;
-        // Resolve IMMEDIATELY on the 101 handshake. Previously we waited for the
-        // first data frame here, which deadlocked the tunnel whenever the bridge
-        // was slow to send telemetry -> browser hung forever ("stuck loading").
-        resolved = true;
-        clearTimeout(timer);
-        const rest = accBuf.subarray(idx + 4);
-        accBuf = Buffer.alloc(0);
-        if (rest.length) accBuf = wsDecodeFrames(rest, (op, p) => frameCbs.forEach(f => f(op, p)));
-        openCbs.forEach(cb => cb());
-        resolve(conn);
-      } else {
-        accBuf = wsDecodeFrames(Buffer.concat([accBuf, chunk]), (op, p) => {
-          if (op === 0x8) { conn.closed = true; closeCbs.forEach(cb => cb()); return; }
-          frameCbs.forEach(f => f(op, p));
-        });
-      }
-    });
-    sock.on("error", (e: any) => {
-      if (!resolved) { clearTimeout(timer); reject(e); }
-    });
-    sock.on("close", () => {
-      conn.ready = false;
-      if (!conn.closed) { conn.closed = true; closeCbs.forEach(cb => cb()); }
-    });
-  });
-}
-
-async function handleWsUpgrade(req: http.IncomingMessage, clientSocket: Duplex, head: Buffer, port: string) {
+async function handleWsUpgrade(req: any, clientSocket: any, head: Buffer, port: string) {
   // Only one live tunnel per port: browsers reconnecting after retries otherwise
   // pile up duplicate sockets against the single-connection Fabric IPC server.
   closeTunnelsForPort(port);
 
   let handshakeDone = false;
-  try {
-    // Start probing/connecting the upstream without touching clientSocket yet;
-    // its data listener is attached only after the browser handshake completes.
-    const base = await getWorkingBridgeBase(port);
-    const wsUrl = base.replace(/^http/, "ws") + "/ws";
+  const failEarly = (reason: string) => {
+    console.warn(`[WS Tunnel] ${reason}`);
+    if (!handshakeDone) {
+      try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"); } catch {}
+    }
+    try { clientSocket.destroy(); } catch {}
+  };
 
-    // CRITICAL ORDERING: complete the browser handshake FIRST, then dial the
-    // bridge asynchronously. The previous order (await upstream before writing
-    // 101) left the browser socket hanging without any response for seconds on
-    // every reconnect -> "stuck loading". Now the tunnel opens instantly and
-    // buffers bridge frames even if they arrive before we finish connecting.
+  try {
+    // Complete the browser handshake FIRST so the dashboard stops hanging even
+    // when the Minecraft bridge is offline; then dial the bridge asynchronously.
     const secKey = req.headers["sec-websocket-key"];
     if (!secKey) { try { clientSocket.destroy(); } catch {} return; }
     const accept = require("crypto").createHash("sha1").update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
@@ -1463,76 +1359,103 @@ async function handleWsUpgrade(req: http.IncomingMessage, clientSocket: Duplex, 
       `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
     );
     handshakeDone = true;
-    let pending: Buffer = head && head.length > 0 ? Buffer.from(head) : Buffer.alloc(0);
 
-    const entry: WsTunnelClient = { socket: clientSocket, buffer: Buffer.alloc(0), cleanup: () => {} };
+    const entry = { socket: clientSocket, buffer: Buffer.alloc(0), cleanup: () => {} };
     if (!wsTunnels.has(port)) wsTunnels.set(port, new Set());
     wsTunnels.get(port)!.add(entry);
 
-    let upstream: UpstreamWsConn | null = null;
-
-    // Browser -> Bridge relay is wired IMMEDIATELY (before the bridge dial
-    // completes). The previous code attached these listeners only AFTER
-    // `await connectUpstreamWs(...)`, which meant frames the browser sent
-    // during that window were never consumed off the socket and the reverse
-    // direction silently stalled. Frames arriving before the bridge is up are
-    // buffered in `earlyFrames` and flushed on connect.
-    const earlyFrames: Array<{ opcode: number; payload: Buffer }> = [];
-    const onData = (chunk: Buffer) => {
-      pending = wsDecodeFrames(Buffer.concat([pending, chunk]), (opcode, payload) => {
-        if (opcode === 0x8) { try { upstream?.close(); } catch {} try { clientSocket.end(); } catch {} return; }
-        if (opcode === 0x9) { try { clientSocket.write(wsEncodeFrame(payload, 0xA)); } catch {} return; } // ping -> pong
-        if (!upstream) { earlyFrames.push({ opcode, payload }); return; }
-        if (opcode === 0x1) upstream.sendText(payload.toString("utf8"));
-        else if (opcode === 0x2) upstream.sendBinary(payload);
-      });
+    let upstreamSock: any = null;
+    const cleanup = () => {
+      entry.cleanup();
+      try { if (upstreamSock) upstreamSock.destroy(); } catch {}
     };
-    const onClose = () => {
-      entry.cleanup();
-      try { upstream?.close(); } catch {}
-    };
-    clientSocket.on("data", onData);
-    clientSocket.on("close", onClose);
-    clientSocket.on("error", onClose);
-
-    let conn: UpstreamWsConn;
-    try {
-      conn = await connectUpstreamWs(wsUrl);
-    } catch (err: any) {
-      console.warn(`[WS Tunnel] Failed to reach bridge :${port} - ${err?.message}`);
-      entry.cleanup();
-      // Close the browser WS cleanly so it retries instead of hanging forever
-      try { clientSocket.write(wsEncodeFrame(Buffer.from("bridge-unreachable", "utf8"), 0x8)); clientSocket.end(); } catch {}
-      return;
-    }
-    upstream = conn;
-    console.log(`[WS Tunnel] Browser <-> bridge :${port} established (${wsUrl})`);
-
-    // Flush any browser frames that arrived while we were still dialing the bridge
-    for (const f of earlyFrames.splice(0)) {
-      if (f.opcode === 0x1) conn.sendText(f.payload.toString("utf8"));
-      else if (f.opcode === 0x2) conn.sendBinary(f.payload);
-    }
-
-    // Bridge -> Browser: forward decoded frames as unmasked frames
-    conn.onFrame((opcode, payload) => {
-      if (opcode === 0x1 || opcode === 0x2 || opcode === 0x9) {
-        try { clientSocket.write(wsEncodeFrame(payload, opcode)); } catch {}
-      }
-    });
-    conn.onClose(() => {
-      entry.cleanup();
-      try { clientSocket.end(); } catch {}
-    });
-
     entry.cleanup = () => {
-      clientSocket.removeListener("data", onData);
-      clientSocket.removeListener("close", onClose);
-      clientSocket.removeListener("error", onClose);
+      clientSocket.removeListener("close", cleanup);
+      clientSocket.removeListener("error", cleanup);
       wsTunnels.get(port)?.delete(entry);
     };
+    clientSocket.on("close", cleanup);
+    clientSocket.on("error", cleanup);
+
+    // Buffer any bytes the browser sends before the bridge is reachable
+    // (e.g. an immediate action packet on open) and flush them once spliced.
+    const earlyChunks: Buffer[] = [];
+    const onDataEarly = (chunk: Buffer) => { earlyChunks.push(chunk); };
+    clientSocket.on("data", onDataEarly);
+
+    let base: string;
+    try {
+      base = await getWorkingBridgeBase(port);
+    } catch (err: any) {
+      failEarly(`bridge probe failed for :${port} - ${err?.message}`);
+      return;
+    }
+    const u = new URL(base);
+    const host = u.hostname;
+    const portNum = parseInt(u.port || "80", 10);
+
+    const key = require("crypto").randomBytes(16).toString("base64");
+    const sock: any = net.connect(portNum, host);
+    upstreamSock = sock;
+    sock.setNoDelay(true);
+
+    const dialed = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 6000);
+      let accBuf: Buffer = Buffer.alloc(0);
+      const onErrClose = () => { clearTimeout(timer); resolve(false); };
+      sock.once("error", onErrClose);
+      sock.once("close", onErrClose);
+      sock.on("connect", () => {
+        sock.write(
+          `GET /ws HTTP/1.1\r\nHost: ${host}:${portNum}\r\n` +
+          "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+        );
+      });
+      const onHandshakeData = (chunk: Buffer) => {
+        accBuf = Buffer.concat([accBuf, chunk]);
+        const idx = accBuf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        const statusLine = accBuf.subarray(0, idx).toString().split("\r\n")[0];
+        if (!/^HTTP\/1\.[01] 101/.test(statusLine)) {
+          clearTimeout(timer);
+          resolve(false);
+          return;
+        }
+        // Handshake ok: detach temp listeners, splice raw streams.
+        sock.removeListener("data", onHandshakeData);
+        sock.removeListener("error", onErrClose);
+        sock.removeListener("close", onErrClose);
+        clearTimeout(timer);
+        const rest = accBuf.subarray(idx + 4);
+        clientSocket.removeListener("data", onDataEarly);
+        // Bridge -> Browser (raw passthrough)
+        sock.pipe(clientSocket);
+        sock.on("close", () => { try { clientSocket.end(); } catch {} });
+        sock.on("error", () => { try { clientSocket.destroy(); } catch {} });
+        // Browser -> Bridge (raw passthrough), flushing anything queued pre-dial
+        for (const c of earlyChunks.splice(0)) { try { sock.write(c); } catch {} }
+        clientSocket.pipe(sock);
+        console.log(`[WS Tunnel] Browser <-> bridge :${port} tunneled (raw TCP -> ${host}:${portNum})`);
+        resolve(true);
+      };
+      sock.on("data", onHandshakeData);
+    });
+
+    if (!dialed) {
+      failEarly(`could not establish WS tunnel to bridge ${host}:${portNum} (is the Fabric client running?)`);
+      // Cleanly close the browser-side WS so it schedules a retry instead of hanging
+      try { clientSocket.write(wsEncodeFrame(Buffer.from("bridge-unreachable", "utf8"), 0x8)); clientSocket.end(); } catch {}
+      entry.cleanup();
+      return;
+    }
+
+    // Any frames that arrived in the tiny race window before pipe() attached
+    if (head && head.length > 0) {
+      try { sock.write(Buffer.from(head)); } catch {}
+    }
   } catch (err: any) {
-    console.warn(`[WS Tunnel] Failed to reach bridge :${port} - ${err?.message}`);
+    failEarly(`tunnel error for :${port} - ${err?.message}`);
     if (!handshakeDone) {
       try {
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
