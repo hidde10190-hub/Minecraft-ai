@@ -47,6 +47,10 @@ if (Get-Command docker -ErrorAction SilentlyContinue) {
         $env:BOT_NAME = $BotName
         
         Write-Host "[Status] Launching fresh containers..." -ForegroundColor Gray
+        # Wipe stale Fabric Loom locks left by interrupted runs (fixes the
+        # "Lock for cache='/root/.gradle/caches/fabric-loom' is currently held" hang)
+        docker run --rm -v minecraft-gradle-cache:/g alpine sh -c "find /g -name '*.lock' -delete" 2>$null | Out-Null
+
         docker compose up -d --remove-orphans
         if ($LASTEXITCODE -ne 0) {
             Write-Host "[Warning] Compose failed. Pruning networks and retrying..." -ForegroundColor Yellow

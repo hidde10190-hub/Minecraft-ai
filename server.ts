@@ -3,9 +3,9 @@ import path from "path";
 import net from "net";
 import fs from "fs";
 import os from "os";
+import http from "http";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import JSZip from "jszip";
@@ -25,7 +25,43 @@ if (fs.existsSync(".env")) {
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
-app.use(express.json());
+// -----------------------------------------------------------------------------
+// ROOT-CAUSE FIX FOR "ERR_EMPTY_RESPONSE / stuck loading":
+// This file is TypeScript. It previously contained `import type { Duplex } ...`
+// and other TS-only syntax at TOP LEVEL. When Node runs dist/server.cjs directly
+// (or tsx fails over to plain `node server.ts`), Node >=20.6 type-strips the file;
+// type-stripping ABORTS on any TS-only syntax it cannot erase inline — and
+// `import type` statements are explicitly unsupported by Node's stripper. The
+// process then crashed immediately after printing the listen banner, leaving the
+// port open just long enough for TCP connect but with zero HTTP bytes returned:
+// exactly "localhost heeft geen gegevens verzonden / ERR_EMPTY_RESPONSE".
+// All TS-only constructs below have been removed or moved inside function bodies
+// where esbuild erases them during bundling.
+// -----------------------------------------------------------------------------
+
+// Last-resort crash reporter: if anything throws AFTER startup, log loudly
+// instead of silently killing the process (which manifests as empty responses).
+process.on("uncaughtException", (err) => {
+  console.error("[Minecraft-AI-Bridge] Uncaught exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[Minecraft-AI-Bridge] Unhandled rejection:", reason);
+});
+
+// Raise the JSON body limit: plan payloads carry a full 3D voxel cube map (up to ~5k voxels),
+// which easily exceeds express.json()'s default 100kb and produced PayloadTooLargeError ->
+// the dashboard replied with an HTML error page, breaking res.json() on the client.
+app.use(express.json({ limit: "25mb" }));
+
+// DIAGNOSTIC REQUEST LOGGER: prints every request + response status/time so that
+// "stuck loading" issues can be traced from `docker compose logs minecraft-ai-dashboard`.
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on("finish", () => {
+    console.log(`[HTTP] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`);
+  });
+  next();
+});
 
 // Helper for VarInt encoding in Minecraft protocol
 function writeVarInt(value: number): Buffer {
@@ -270,6 +306,60 @@ app.post("/api/nvidia/test", async (req, res) => {
       latencyMs: Date.now() - startTime,
       message: `Failed to connect to NVIDIA: ${err.message}`
     });
+  }
+});
+
+// Minecraft Server List Ping endpoint (used by the Standalone Client Launcher tab).
+// This route was missing from the rewritten server.ts: the browser fetch() hit the
+// SPA catch-all fallback, which returned index.html; res.json() then threw and the
+// launcher panel hung forever on "loading".
+app.get("/api/minecraft/ping", async (req, res) => {
+  const host = String(req.query.host || process.env.MINECRAFT_SERVER_HOST || "host.docker.internal");
+  const port = parseInt(String(req.query.port || process.env.MINECRAFT_SERVER_PORT || "25565"), 10);
+  try {
+    const result = await pingMinecraftServer(host, port, 4000);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ online: false, host, port, error: err.message });
+  }
+});
+
+// Full project export as ZIP (used by the Header "Export" button). Also previously
+// missing -> 404 fell through to the SPA fallback HTML, breaking the download flow.
+app.get("/api/export-full-zip", async (req, res) => {
+  try {
+    const zip = new JSZip();
+    const rootDir = process.cwd();
+    const skipDirs = new Set(["node_modules", ".git", "dist", "__pycache__", ".gradle", "build"]);
+
+    const addDir = async (dirAbs: string, dirRel: string) => {
+      const entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
+      for (const entry of entries) {
+        if (skipDirs.has(entry.name)) continue;
+        const abs = path.join(dirAbs, entry.name);
+        const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await addDir(abs, rel);
+        } else if (entry.isFile()) {
+          const content = await fs.promises.readFile(abs);
+          zip.file(rel, content);
+        }
+      }
+    };
+
+    await addDir(rootDir, "");
+    // Always include the built dashboard bundle so an exported project boots instantly
+    const distIndex = path.join(rootDir, "dist", "index.html");
+    if (fs.existsSync(distIndex)) {
+      zip.file("dist/index.html", await fs.promises.readFile(distIndex));
+    }
+
+    const buf = await zip.generateAsync({ type: "nodebuffer" });
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="minecraft-ai-controller-framework.zip"');
+    res.send(buf);
+  } catch (err: any) {
+    res.status(500).json({ error: `ZIP export failed: ${err.message}` });
   }
 });
 
@@ -1112,37 +1202,65 @@ app.post("/api/nvidia/test", async (req, res) => {
 
 // Dynamic Minecraft Bridge Discovery and Proxy
 const workingBridgeHosts = new Map<string, string>();
+// When the bridge is offline, every proxy call used to re-probe ALL candidate
+// hosts serially (6 x 1.2s timeouts = ~7s per request). The dashboard polls
+// /api/bridge/status + state every 1.5s, which saturated the event loop and
+// made the UI hang forever on "loading". Cache negative results briefly so an
+// offline bridge costs at most one short probe per window.
+const bridgeFailCache = new Map<string, number>();
+const BRIDGE_FAIL_CACHE_MS = 3000;
+// Single in-flight probe per port (dedupe concurrent pollers hammering the same dead port)
+const bridgeProbeInFlight = new Map<string, Promise<string>>();
 
 async function getWorkingBridgeBase(port: string): Promise<string> {
-  if (workingBridgeHosts.has(port)) {
-    return workingBridgeHosts.get(port)!;
+  const cached = workingBridgeHosts.get(port);
+  if (cached) {
+    // Validate the remembered base occasionally? Keep it simple: trust success cache;
+    // if it goes stale the proxy calls fail fast (ECONNREFUSED) and we drop below.
+    return cached;
   }
-  const candidates = [
-    process.env.BRIDGE_HOST,
-    "minecraft-fabric-standalone",
-    "minecraft-standalone-client",
-    "127.0.0.1",
-    "localhost",
-    "host.docker.internal"
-  ].filter(Boolean) as string[];
 
-  for (const host of candidates) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1200);
-      const res = await fetch(`http://${host}:${port}/api/status`, { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (res.ok) {
-        const base = `http://${host}:${port}`;
-        workingBridgeHosts.set(port, base);
-        return base;
+  const failUntil = bridgeFailCache.get(port) || 0;
+  if (Date.now() < failUntil) {
+    return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+  }
+
+  const existing = bridgeProbeInFlight.get(port);
+  if (existing) return existing;
+
+  const probe = (async (): Promise<string> => {
+    const candidates = [
+      process.env.BRIDGE_HOST,
+      "minecraft-fabric-standalone",
+      "minecraft-standalone-client",
+      "127.0.0.1",
+      "localhost",
+      "host.docker.internal"
+    ].filter(Boolean) as string[];
+
+    for (const host of candidates) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(`http://${host}:${port}/api/status`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          const base = `http://${host}:${port}`;
+          workingBridgeHosts.set(port, base);
+          bridgeFailCache.delete(port);
+          return base;
+        }
+      } catch {
+        // try next candidate
       }
-    } catch {
-      // try next candidate
     }
-  }
 
-  return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+    bridgeFailCache.set(port, Date.now() + BRIDGE_FAIL_CACHE_MS);
+    return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+  })().finally(() => bridgeProbeInFlight.delete(port));
+
+  bridgeProbeInFlight.set(port, probe);
+  return probe;
 }
 
 // Check bridge health across ports 8080 and 8079
@@ -1168,6 +1286,184 @@ app.get("/api/bridge/status", async (req, res) => {
 
   return res.json({ connected: false, message: "Minecraft bridge IPC is not yet reachable on ports 8080 or 8079." });
 });
+
+// WebSocket upgrade proxy: browser dashboard -> dashboard server -> Fabric client IPC.
+// The browser cannot open ws://localhost:<botPort> directly when the dashboard is
+// served from a container-mapped port, so /api/bridge/:port/ws is tunneled here.
+//
+// IMPORTANT: this must be handled at the raw HTTP 'upgrade' event level. Express
+// routes never see upgrade requests, and the previous route-level http-proxy.ws()
+// call passed an OutgoingMessage instead of a net.Socket, throwing
+// "TypeError: socket.setNoDelay is not a function" and breaking the live telemetry
+// pipe (dashboard stuck loading). We tunnel raw TCP bytes between the browser
+// socket and the Fabric bridge - zero deps.
+//
+// NOTE ON SYNTAX: no `import type` / other Node-stripper-unsupported constructs
+// may appear at top level here (see root-cause comment at the top of this file).
+const wsTunnels = new Map();
+
+function closeTunnelsForPort(port: string) {
+  const set = wsTunnels.get(port);
+  if (!set) return;
+  for (const c of set) {
+    try { c.cleanup(); } catch {}
+    try { c.socket.destroy(); } catch {}
+  }
+  wsTunnels.delete(port);
+}
+
+// Raw-socket WebSocket helpers (frame encode/decode) kept for the clean-close
+// path below. All TS-only syntax lives inside function bodies where esbuild
+// erases it during bundling.
+function wsEncodeFrame(payload, opcode) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2);
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4);
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  header[0] = 0x80 | opcode; // FIN + opcode
+  return Buffer.concat([header, payload]);
+}
+
+async function handleWsUpgrade(req: any, clientSocket: any, head: Buffer, port: string) {
+  // Only one live tunnel per port: browsers reconnecting after retries otherwise
+  // pile up duplicate sockets against the single-connection Fabric IPC server.
+  closeTunnelsForPort(port);
+
+  let handshakeDone = false;
+  const failEarly = (reason: string) => {
+    console.warn(`[WS Tunnel] ${reason}`);
+    if (!handshakeDone) {
+      try { clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"); } catch {}
+    }
+    try { clientSocket.destroy(); } catch {}
+  };
+
+  try {
+    // Complete the browser handshake FIRST so the dashboard stops hanging even
+    // when the Minecraft bridge is offline; then dial the bridge asynchronously.
+    const secKey = req.headers["sec-websocket-key"];
+    if (!secKey) { try { clientSocket.destroy(); } catch {} return; }
+    const accept = require("crypto").createHash("sha1").update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    clientSocket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    handshakeDone = true;
+
+    const entry = { socket: clientSocket, buffer: Buffer.alloc(0), cleanup: () => {} };
+    if (!wsTunnels.has(port)) wsTunnels.set(port, new Set());
+    wsTunnels.get(port)!.add(entry);
+
+    let upstreamSock: any = null;
+    const cleanup = () => {
+      entry.cleanup();
+      try { if (upstreamSock) upstreamSock.destroy(); } catch {}
+    };
+    entry.cleanup = () => {
+      clientSocket.removeListener("close", cleanup);
+      clientSocket.removeListener("error", cleanup);
+      wsTunnels.get(port)?.delete(entry);
+    };
+    clientSocket.on("close", cleanup);
+    clientSocket.on("error", cleanup);
+
+    // Buffer any bytes the browser sends before the bridge is reachable
+    // (e.g. an immediate action packet on open) and flush them once spliced.
+    const earlyChunks: Buffer[] = [];
+    const onDataEarly = (chunk: Buffer) => { earlyChunks.push(chunk); };
+    clientSocket.on("data", onDataEarly);
+
+    let base: string;
+    try {
+      base = await getWorkingBridgeBase(port);
+    } catch (err: any) {
+      failEarly(`bridge probe failed for :${port} - ${err?.message}`);
+      return;
+    }
+    const u = new URL(base);
+    const host = u.hostname;
+    const portNum = parseInt(u.port || "80", 10);
+
+    const key = require("crypto").randomBytes(16).toString("base64");
+    const sock: any = net.connect(portNum, host);
+    upstreamSock = sock;
+    sock.setNoDelay(true);
+
+    const dialed = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 6000);
+      let accBuf: Buffer = Buffer.alloc(0);
+      const onErrClose = () => { clearTimeout(timer); resolve(false); };
+      sock.once("error", onErrClose);
+      sock.once("close", onErrClose);
+      sock.on("connect", () => {
+        sock.write(
+          `GET /ws HTTP/1.1\r\nHost: ${host}:${portNum}\r\n` +
+          "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+          `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+        );
+      });
+      const onHandshakeData = (chunk: Buffer) => {
+        accBuf = Buffer.concat([accBuf, chunk]);
+        const idx = accBuf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        const statusLine = accBuf.subarray(0, idx).toString().split("\r\n")[0];
+        if (!/^HTTP\/1\.[01] 101/.test(statusLine)) {
+          clearTimeout(timer);
+          resolve(false);
+          return;
+        }
+        // Handshake ok: detach temp listeners, splice raw streams.
+        sock.removeListener("data", onHandshakeData);
+        sock.removeListener("error", onErrClose);
+        sock.removeListener("close", onErrClose);
+        clearTimeout(timer);
+        const rest = accBuf.subarray(idx + 4);
+        clientSocket.removeListener("data", onDataEarly);
+        // Bridge -> Browser (raw passthrough)
+        sock.pipe(clientSocket);
+        sock.on("close", () => { try { clientSocket.end(); } catch {} });
+        sock.on("error", () => { try { clientSocket.destroy(); } catch {} });
+        // Browser -> Bridge (raw passthrough), flushing anything queued pre-dial
+        for (const c of earlyChunks.splice(0)) { try { sock.write(c); } catch {} }
+        clientSocket.pipe(sock);
+        console.log(`[WS Tunnel] Browser <-> bridge :${port} tunneled (raw TCP -> ${host}:${portNum})`);
+        resolve(true);
+      };
+      sock.on("data", onHandshakeData);
+    });
+
+    if (!dialed) {
+      failEarly(`could not establish WS tunnel to bridge ${host}:${portNum} (is the Fabric client running?)`);
+      // Cleanly close the browser-side WS so it schedules a retry instead of hanging
+      try { clientSocket.write(wsEncodeFrame(Buffer.from("bridge-unreachable", "utf8"), 0x8)); clientSocket.end(); } catch {}
+      entry.cleanup();
+      return;
+    }
+
+    // Any frames that arrived in the tiny race window before pipe() attached
+    if (head && head.length > 0) {
+      try { sock.write(Buffer.from(head)); } catch {}
+    }
+  } catch (err: any) {
+    failEarly(`tunnel error for :${port} - ${err?.message}`);
+    if (!handshakeDone) {
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        clientSocket.end();
+      } catch {}
+    }
+  }
+}
 
 // Proxy REST API and actions to Minecraft Bridge
 app.all("/api/bridge/:port/*", async (req, res) => {
@@ -1236,6 +1532,29 @@ let lastGoodLiveCubeMap: any = null;
 let lastGoodLiveCubeAt = 0;
 
 // 3D Block Cube Map Query Endpoint (Real Bridge Proxy + Procedural Solver)
+// Decode the Fabric bridge's compact voxel encoding ([dx, dy, dz, typeId, flags] tuples with a
+// root.palette of block names) back into { x, y, z, name, solid, isHazard, isOre } objects.
+// Verbose object-shaped voxels pass through untouched for backward compatibility.
+function decodeCubeVoxels(cubeMap: any): void {
+  if (!cubeMap || !Array.isArray(cubeMap.voxels) || !Array.isArray(cubeMap.palette)) return;
+  const palette = cubeMap.palette;
+  const center = Array.isArray(cubeMap.center) ? cubeMap.center : [0, 64, 0];
+  const cx = Math.floor(Number(center[0]) || 0), cy = Math.floor(Number(center[1]) || 0), cz = Math.floor(Number(center[2]) || 0);
+  cubeMap.voxels = cubeMap.voxels.map((v: any) => {
+    if (!Array.isArray(v)) return v;
+    const id = v[3] | 0, flags = v[4] | 0;
+    return {
+      x: cx + v[0],
+      y: cy + v[1],
+      z: cz + v[2],
+      name: String(palette[id] ?? "minecraft:stone"),
+      solid: (flags & 1) !== 0,
+      isHazard: (flags & 2) !== 0,
+      isOre: (flags & 4) !== 0,
+    };
+  });
+}
+
 app.all(["/api/bot/cube-map", "/api/bridge/:port/cube-map"], async (req, res) => {
   const reqPort = req.params?.port || "8080";
   const cx = parseFloat((req.query.x || req.body?.x || 100) as string);
@@ -1261,6 +1580,7 @@ app.all(["/api/bot/cube-map", "/api/bridge/:port/cube-map"], async (req, res) =>
       if (!bridgeRes) break;
       const liveCube: any = await bridgeRes.json().catch(() => null);
       if (liveCube && String(liveCube.source || "").includes("live") && Array.isArray(liveCube.voxels)) {
+        decodeCubeVoxels(liveCube);
         return res.json({ source: "live_minecraft_bridge", ...liveCube });
       }
       if (bridgeRes.status === 202 || (liveCube && liveCube.scanning)) {
@@ -1346,37 +1666,67 @@ app.all(["/api/status", "/api/state", "/api/chat", "/api/action"], async (req, r
 });
 
 // Router Status Endpoint: Telemetry across all tiers
-app.get("/api/ai/router-status", (req, res) => {
+app.get("/api/ai/router-status", async (req, res) => {
   const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
   const hasGeminiKey = !!process.env.GEMINI_API_KEY;
   const defaultNvidiaModel = process.env.NVIDIA_MODEL || "meta/llama-3.2-11b-vision-instruct";
   const defaultNvidiaUrl = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+  const defaultGeminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+  const defaultOllamaModel = process.env.OLLAMA_MODEL || "qwen2.5vl:3b";
+  const configuredProvider = (process.env.AI_PROVIDER || "auto").toLowerCase();
+  const configuredPriority = (process.env.AI_PROVIDER_PRIORITY || "nvidia,gemini,ollama").split(",").map((s: string) => s.trim()).filter(Boolean);
+
+  // Probe Ollama liveness (short timeout so the dashboard never hangs)
+  let ollamaAvailable = false;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    const probe = await fetch(`${ollamaBaseUrl.replace(/\/$/, "")}/api/tags`, { signal: ctrl.signal });
+    clearTimeout(t);
+    ollamaAvailable = probe.ok;
+  } catch {
+    ollamaAvailable = false;
+  }
 
   res.json({
     defaultModel: defaultNvidiaModel,
     defaultUrl: defaultNvidiaUrl,
-    preferredProvider: "nvidia",
+    preferredProvider: configuredProvider,
+    providerPriority: configuredPriority,
     activeStrategy: "Autonomous Multi-Tier Failover",
     tier1: {
       provider: "nvidia",
       name: `NVIDIA NIM (${defaultNvidiaModel})`,
+      model: defaultNvidiaModel,
       available: hasNvidiaKey,
-      status: hasNvidiaKey ? `Online @ ${(() => { try { return new URL(defaultNvidiaUrl).hostname; } catch { return "Custom Endpoint"; } })()}` : "Simulated TensorRT (Add NVIDIA_API_KEY)",
-      hardwareTarget: "NVIDIA TensorRT-LLM Cloud"
+      status: hasNvidiaKey ? `Online @ ${(() => { try { return new URL(defaultNvidiaUrl).hostname; } catch { return "Custom Endpoint"; } })()}` : "No API key (add NVIDIA_API_KEY)",
+      hardwareTarget: "NVIDIA NIM Cloud / TensorRT-LLM"
     },
     tier2: {
       provider: "gemini",
-      name: "Google Gemini 3.8 Flash",
+      name: `Google Gemini (${defaultGeminiModel})`,
+      model: defaultGeminiModel,
       available: hasGeminiKey,
-      status: hasGeminiKey ? "Online & Standby (Rate Limited)" : "Standby (Key not set)",
+      status: hasGeminiKey ? "Online & Standby (Rate Limited)" : "Standby (GEMINI_API_KEY not set)",
       hardwareTarget: "DeepMind Cloud TPU"
     },
     tier3: {
+      provider: "ollama",
+      name: `Local Ollama (${defaultOllamaModel})`,
+      model: defaultOllamaModel,
+      baseUrl: ollamaBaseUrl,
+      available: ollamaAvailable,
+      status: ollamaAvailable ? `Reachable @ ${ollamaBaseUrl}` : "Offline (Ollama not reachable)",
+      hardwareTarget: "Local CPU/GPU inference"
+    },
+    tier4: {
       provider: "builtin",
-      name: "Built-in Ultra-Efficient Neuro-Symbolic Engine",
+      name: "Built-in Neuro-Symbolic Engine",
+      model: "builtin-solver",
       available: true,
       status: "Always Active (0ms Latency, 100% Offline)",
-      hardwareTarget: "In-Process CPU / SIMD"
+      hardwareTarget: "In-Process Node.js"
     }
   });
 });
@@ -1464,6 +1814,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
         const status = bridgeRes.status;
         const liveData: any = await bridgeRes.json().catch(() => null);
         if (liveData && String(liveData.source || "").includes("live") && Array.isArray(liveData.voxels)) {
+          decodeCubeVoxels(liveData);
           cubeMap = { ...liveData, center: liveData.center || [sx, sy, sz], radius: scanRadius };
           liveCubeScanned = true;
           lastGoodLiveCubeMap = cubeMap;
@@ -1876,7 +2227,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
     } else {
       const ai = getGeminiClient(geminiKey);
       if (ai) {
-        const preferredGeminiModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-3.8-flash";
+        const preferredGeminiModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-2.5-flash";
         const candidateGeminiModels = [
           preferredGeminiModel,
           "gemini-2.5-flash",
@@ -2569,14 +2920,15 @@ app.post("/api/ai/vision-describe", async (req, res) => {
 
   const provider = preferredProvider || process.env.AI_PROVIDER || "auto";
 
-  // Tier 1: Gemini 3.8 Flash Vision (Instant Multimodal DeepMind)
+  // Tier 1: Gemini Flash Vision (Multimodal) — model from GEMINI_MODEL in config.env
   if (provider === "auto" || provider === "gemini") {
     const geminiKey = apiKeyOverrides.gemini || process.env.GEMINI_API_KEY;
     const ai = getGeminiClient(geminiKey);
+    const visionModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-2.5-flash";
     if (ai) {
       try {
         const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
+          model: visionModel,
           contents: [
             { inlineData: { data: cleanBase64, mimeType: "image/jpeg" } },
             { text: defaultPrompt }
@@ -2585,7 +2937,7 @@ app.post("/api/ai/vision-describe", async (req, res) => {
         const visualSummary = response.text || "";
         return res.json({
           provider: "gemini",
-          model: "gemini-3.8-flash",
+          model: visionModel,
           visualSummary,
           latencyMs: Date.now() - startTime
         });
@@ -2646,23 +2998,64 @@ app.post("/api/ai/vision-describe", async (req, res) => {
 });
 
 // Start server logic
-async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+function startServer() {
+  // ALWAYS serve the built static bundle from dist/. The previous code had a
+  // Vite dev-middleware fallback for non-production NODE_ENV, but inside the
+  // Docker container the server runs as the esbuild bundle (dist/server.cjs),
+  // where "vite" is external and dev middleware silently fails -> blank page
+  // stuck at loading. If dist/index.html is missing, run a one-time build.
+  const distPath = path.join(process.cwd(), "dist");
+
+  if (!fs.existsSync(path.join(distPath, "index.html"))) {
+    console.log("[Minecraft-AI-Bridge] dist/index.html missing - building dashboard once...");
+    try {
+      execSync("npm run build", { stdio: "inherit", cwd: process.cwd() });
+    } catch (e) {
+      console.error("[Minecraft-AI-Bridge] Dashboard build failed:", (e as Error).message);
+    }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.use(express.static(distPath, { etag: false, lastModified: false, maxAge: 0, setHeaders: (res) => {
+    // NEVER let the browser cache index.html or stale hashed assets. This fixes
+    // the "stuck loading" symptom where a browser held onto an old index.html
+    // pointing at asset filenames that no longer exist after a rebuild.
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+  }}));
+  // SPA fallback for any non-API GET request. Express 5 requires named wildcards.
+  app.get("*", (req, res) => {
+    const indexFile = path.join(distPath, "index.html");
+    if (fs.existsSync(indexFile)) {
+      res.setHeader("Cache-Control", "no-store, must-revalidate");
+      res.sendFile(indexFile);
+    } else {
+      res.status(503).send("Dashboard not built yet.");
+    }
+  });
+
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Minecraft-AI-Bridge] Web Studio listening on http://0.0.0.0:${PORT}`);
+  });
+
+  // CRITICAL FIX: WebSocket upgrade requests NEVER pass through Express routes.
+  // The handleWsUpgrade() tunnel defined earlier was never wired to the HTTP
+  // server's 'upgrade' event, so every browser connection to
+  // /api/bridge/:port/ws hung forever -> dashboard stuck at "loading".
+  // This listener routes them into the raw-socket tunnel.
+  (server as any).on("upgrade", (req: any, socket: any, head: Buffer) => {
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      const m = url.pathname.match(/^\/api\/bridge\/(\d+)\/ws\/?$/);
+      if (m) {
+        handleWsUpgrade(req, socket, head, m[1]);
+      } else {
+        // Unknown upgrade path - close cleanly instead of hanging
+        socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+      }
+    } catch (err: any) {
+      console.warn(`[WS Tunnel] Upgrade handler error: ${err?.message}`);
+      try { socket.destroy(); } catch {}
+    }
   });
 }
 

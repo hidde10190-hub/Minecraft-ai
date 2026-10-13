@@ -18,11 +18,11 @@ export const DEFAULT_ENV_CONFIG: UnifiedEnvConfig = {
 
   // 3. AI Providers & APIs
   geminiApiKey: "",
-  geminiModel: "gemini-3.8-flash",
+  geminiModel: "gemini-2.5-flash",
   nvidiaApiKey: "",
   nvidiaModel: "meta/llama-3.2-11b-vision-instruct",
   nvidiaBaseUrl: "https://integrate.api.nvidia.com/v1",
-  ollamaModel: "llama3.2:3b",
+  ollamaModel: "qwen2.5vl:3b",
   ollamaBaseUrl: "http://127.0.0.1:11434",
   ollamaNumCtx: 131072,
   ollamaVisionModel: "moondream:1.8b",
@@ -69,10 +69,10 @@ export function loadSavedEnvConfig(): UnifiedEnvConfig {
     if (!parsed.nvidiaModel || parsed.nvidiaModel === "meta/llama-3.1-405b-instruct" || parsed.nvidiaModel === "google/diffusiongemma-26b-a4b-it" || parsed.nvidiaModel === "meta/llama-3.3-70b-instruct") {
       parsed.nvidiaModel = "meta/llama-3.2-11b-vision-instruct";
     }
-    if (!parsed.geminiModel || parsed.geminiModel === "gemini-1.5-pro" || parsed.geminiModel === "gemini-1.5-flash" || parsed.geminiModel === "gemini-2.0-flash") {
-      parsed.geminiModel = "gemini-3.8-flash";
+    if (!parsed.geminiModel || parsed.geminiModel === "gemini-1.5-pro" || parsed.geminiModel === "gemini-1.5-flash" || parsed.geminiModel === "gemini-2.0-flash" || parsed.geminiModel === "gemini-3.8-flash") {
+      parsed.geminiModel = "gemini-2.5-flash";
     }
-    if (!parsed.ollamaModel || parsed.ollamaModel === "qwen2.5-coder:7b") parsed.ollamaModel = "llama3.2:3b";
+    if (!parsed.ollamaModel || parsed.ollamaModel === "qwen2.5-coder:7b" || parsed.ollamaModel === "llama3.2:3b") parsed.ollamaModel = "qwen2.5vl:3b";
     if (!parsed.ollamaBaseUrl) parsed.ollamaBaseUrl = "http://host.docker.internal:11434";
     if (!parsed.ollamaNumCtx) parsed.ollamaNumCtx = 131072;
     if (!parsed.ollamaVisionModel) parsed.ollamaVisionModel = "moondream:1.8b";

@@ -253,10 +253,10 @@ export const AutonomousAgentControlHub: React.FC<AutonomousAgentControlHubProps>
             {provider === "nvidia" ? <Cpu className="h-3 w-3 text-emerald-400" /> : provider === "ollama" ? <Radio className="h-3 w-3 text-orange-400" /> : provider === "builtin" ? <Zap className="h-3 w-3 text-amber-400" /> : <Sparkles className="h-3 w-3 text-cyan-400" />}
           </div>
           <div className="font-bold text-slate-200 truncate">
-            {routerMetrics?.routingPath || (provider === "nvidia" ? "NVIDIA NIM (Llama-3.3)" : provider === "ollama" ? "Local Ollama" : provider === "builtin" ? "Built-in Solver" : "Gemini Cloud")}
+            {routerMetrics?.routingPath || (provider === "nvidia" ? "NVIDIA NIM Cloud" : provider === "ollama" ? "Local Ollama" : provider === "builtin" ? "Built-in Solver" : provider === "auto" ? "Auto Multi-Tier Router" : "Gemini Cloud")}
           </div>
           <span className="text-[10px] text-emerald-400 block truncate">
-            Latency: {routerMetrics?.latencyMs ?? 15}ms • Zero throttling
+            Latency: {routerMetrics?.latencyMs ?? "—"}ms{routerMetrics ? "" : " (idle)"}
           </span>
         </div>
 

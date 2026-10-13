@@ -404,7 +404,9 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(action)
       }).catch(() => {
-        fetch(`http://localhost:${targetPort}/api/action`, {
+        // Last-resort fallback also goes through the same-origin dashboard proxy
+        // (direct browser->bot fetch is blocked by CORS in the Docker setup).
+        fetch(`/api/bridge/${targetPort}/action`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(action)
@@ -453,7 +455,8 @@ export default function App() {
     const connect = (port: number, index: number) => {
       try {
         console.log(`[IPC] Attempting connection to port ${port}...`);
-        const ws = new WebSocket(`ws://localhost:${port}/ws`);
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(`${wsProto}//${window.location.host}/api/bridge/${port}/ws`);
         socketsMap.set(port, ws);
         socketsRef.current = socketsMap;
 
@@ -1549,7 +1552,7 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              model: envConfig.ollamaModel || "llama3.2:3b",
+              model: envConfig.ollamaModel || "qwen2.5vl:3b",
               format: "json",
               messages: [
                 { role: "system", content: ollamaSystemInstruction },
@@ -1645,7 +1648,7 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
               data = {
                 thought,
                 actions: actionsList,
-                routingPath: `Tier 3: Local Ollama (${envConfig.ollamaModel || "qwen2.5-coder:7b"} @ ${sanitizedBase})`,
+                routingPath: `Tier 3: Local Ollama (${envConfig.ollamaModel || "qwen2.5vl:3b"} @ ${sanitizedBase})`,
                 activeTier: "ollama",
                 latencyMs: 120
               };
@@ -2185,7 +2188,7 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
         aiAutonomyEnabled={isAutonomousMode}
         onToggleAutonomy={() => setIsAutonomousMode(!isAutonomousMode)}
         activeTier={routerMetrics?.activeTier || provider}
-        modelUsed={routerMetrics?.modelUsed || (provider === "nvidia" ? nvidiaModel : provider === "ollama" ? envConfig.ollamaModel : "gemini-3.8-flash")}
+        modelUsed={routerMetrics?.modelUsed || (provider === "nvidia" ? nvidiaModel : provider === "ollama" ? envConfig.ollamaModel : envConfig.geminiModel || "gemini-2.5-flash")}
       />
 
       {/* Main Content Area */}
@@ -2495,7 +2498,7 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
         {/* Tab: Self-Learning Skills & Failures Studio */}
         {activeTab === "skills" && (
           <SkillsAndFailuresStudio
-            ollamaModel={envConfig.ollamaModel || "llama3.2:3b"}
+            ollamaModel={envConfig.ollamaModel || "qwen2.5vl:3b"}
             onSelectOllamaModel={(m) => updateEnvConfig({ ollamaModel: m })}
             onTriggerGoal={(goalText) => {
               setActiveGoal(goalText);

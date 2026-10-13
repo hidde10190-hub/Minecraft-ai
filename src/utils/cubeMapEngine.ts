@@ -156,7 +156,28 @@ export function normalizeLiveCubeMap(raw: any): BlockCubeMap | null {
     const r = Math.max(1, Math.min(16, Math.floor(raw.radius ?? 8)));
     const width = r * 2 + 1;
 
-    const voxels: VoxelBlock[] = raw.voxels.map((v: any) => {
+    // The Fabric bridge emits a compact palette encoding: voxels are [dx, dy, dz, typeId, flags]
+    // tuples with root.palette holding block names. Decode to full objects here so every consumer
+    // sees the same shape regardless of transport size optimizations.
+    const palette: string[] = Array.isArray(raw.palette) ? raw.palette : [];
+    const decodeVoxel = (v: any) => {
+      if (Array.isArray(v)) {
+        const flags = v[4] | 0;
+        return {
+          x: center[0] + (v[0] | 0),
+          y: center[1] + (v[1] | 0),
+          z: center[2] + (v[2] | 0),
+          name: String(palette[v[3] | 0] ?? "minecraft:stone"),
+          solid: (flags & 1) !== 0,
+          isHazard: (flags & 2) !== 0,
+          isOre: (flags & 4) !== 0,
+        };
+      }
+      return v;
+    };
+
+    const voxels: VoxelBlock[] = raw.voxels.map((rv: any) => {
+      const v = decodeVoxel(rv);
       const name = String(v.name).startsWith("minecraft:") ? v.name : `minecraft:${v.name}`;
       const meta = getBlockMeta(name);
       return {
