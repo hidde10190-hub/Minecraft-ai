@@ -24,7 +24,13 @@ if %ERRORLEVEL% EQU 0 (
     REM Aggressive Cleanup (The Nuclear Fix)
     echo [Status] Performing Nuclear Fix to ensure no stale containers exist...
     
-    REM 1. Try to stop our specific names first
+        REM 0. Kill leftover Gradle daemons and wipe stale Fabric Loom locks from the
+    REM    named cache volume. This fixes the hang:
+    REM    "Lock for cache='/root/.gradle/caches/fabric-loom' is currently held by pid 'NNN'"
+    REM    which happens when a previous runClient was interrupted (Ctrl+C / auto-restart).
+    docker run --rm -v minecraft-gradle-cache:/g eclipse-temurin:25-jdk-noble bash -c "find /g -name *.lock -delete" >nul 2>&1
+
+REM 1. Try to stop our specific names first
     docker stop minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >nul 2>&1
     docker rm -f minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >nul 2>&1
     

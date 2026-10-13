@@ -60,6 +60,12 @@ def main():
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=root_dir)
         
         print("[Status] Launching fresh containers...")
+        # Wipe stale Fabric Loom locks left by interrupted runs (fixes the
+        # "Lock for cache='/root/.gradle/caches/fabric-loom' is currently held" hang)
+        subprocess.run(["docker", "run", "--rm", "-v", "minecraft-gradle-cache:/g",
+                        "eclipse-temurin:25-jdk-noble", "bash", "-c",
+                        "find /g -name '*.lock' -delete"],
+                       capture_output=True, cwd=root_dir)
         subprocess.run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=root_dir)
         print("\nStreaming live container logs (Ctrl+C to detach):")
         try:
