@@ -1293,66 +1293,237 @@ function closeTunnelsForPort(port: string) {
   wsTunnels.delete(port);
 }
 
+// ---- Minimal RFC6455 frame helpers (zero deps, works on Node 18+) ----
+function wsEncodeFrame(payload: Buffer, opcode: number): Buffer {
+  const len = payload.length;
+  let header: Buffer;
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2);
+    header[1] = len;
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4);
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.allocUnsafe(10);
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  header[0] = 0x80 | opcode; // FIN + opcode
+  return Buffer.concat([header, payload]);
+}
+
+// Incrementally decode frames from a growing buffer. Returns leftover bytes.
+function wsDecodeFrames(buf: Buffer, onFrame: (opcode: number, payload: Buffer) => void): Buffer {
+  let pos = 0;
+  while (buf.length - pos >= 2) {
+    const opcode = buf[pos] & 0x0f;
+    const masked = (buf[pos + 1] & 0x80) !== 0;
+    let len = buf[pos + 1] & 0x7f;
+    let off = pos + 2;
+    if (len === 126) {
+      if (buf.length - off < 2) break;
+      len = buf.readUInt16BE(off); off += 2;
+    } else if (len === 127) {
+      if (buf.length - off < 8) break;
+      len = Number(buf.readBigUInt64BE(off)); off += 8;
+    }
+    let maskKey: Buffer | null = null;
+    if (masked) {
+      if (buf.length - off < 4) break;
+      maskKey = buf.subarray(off, off + 4); off += 4;
+    }
+    if (buf.length - off < len) break;
+    const payload = Buffer.from(buf.subarray(off, off + len));
+    if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+    off += len;
+    pos = off;
+    onFrame(opcode, payload);
+  }
+  return buf.subarray(pos);
+}
+
+interface UpstreamWsConn {
+  socket: Duplex;
+  ready: boolean;
+  closed: boolean;
+  sendText: (s: string) => void;
+  sendBinary: (b: Buffer) => void;
+  close: () => void;
+  onOpen: (cb: () => void) => void;
+  onFrame: (cb: (opcode: number, payload: Buffer) => void) => void;
+  onClose: (cb: () => void) => void;
+}
+
+// Raw-socket WebSocket client: performs the opening handshake and parses frames.
+// Replaces global WebSocket (unavailable on Node < 21 / needs flags on 20).
+function connectUpstreamWs(urlStr: string, timeoutMs = 4000): Promise<UpstreamWsConn> {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlStr);
+    const portNum = parseInt(u.port || "80", 10);
+    const sock: any = net.connect(portNum, u.hostname);
+    const openCbs: Array<() => void> = [];
+    const frameCbs: Array<(op: number, p: Buffer) => void> = [];
+    const closeCbs: Array<() => void> = [];
+    const conn: UpstreamWsConn = {
+      socket: sock,
+      ready: false,
+      closed: false,
+      sendText: (s) => { try { sock.write(wsEncodeFrame(Buffer.from(s, "utf8"), 0x1)); } catch {} },
+      sendBinary: (b) => { try { sock.write(wsEncodeFrame(b, 0x2)); } catch {} },
+      close: () => {
+        if (conn.closed) return;
+        conn.closed = true;
+        try { sock.write(wsEncodeFrame(Buffer.alloc(0), 0x8)); sock.end(); } catch { try { sock.destroy(); } catch {} }
+      },
+      onOpen: (cb) => { openCbs.push(cb); },
+      onFrame: (cb) => { frameCbs.push(cb); },
+      onClose: (cb) => { closeCbs.push(cb); },
+    };
+
+    const key = require("crypto").randomBytes(16).toString("base64");
+    let handshaken = false;
+    let accBuf: Buffer = Buffer.alloc(0);
+    let resolved = false;
+
+    const timer = setTimeout(() => {
+      if (!resolved) { try { sock.destroy(); } catch {}; reject(new Error("upstream WS handshake timeout")); }
+    }, timeoutMs);
+
+    sock.on("connect", () => {
+      sock.write(
+        `GET ${u.pathname || "/"} HTTP/1.1\r\nHost: ${u.hostname}:${portNum}\r\n` +
+        "Upgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`
+      );
+    });
+    sock.on("data", (chunk: Buffer) => {
+      if (!handshaken) {
+        accBuf = Buffer.concat([accBuf, chunk]);
+        const idx = accBuf.indexOf("\r\n\r\n");
+        if (idx === -1) return;
+        const headStr = accBuf.subarray(0, idx).toString();
+        if (!/^HTTP\/1\.1 101/.test(headStr.split("\r\n")[0])) {
+          clearTimeout(timer);
+          try { sock.destroy(); } catch {}
+          reject(new Error(`bridge refused upgrade: ${headStr.split("\r\n")[0]}`));
+          return;
+        }
+        handshaken = true;
+        conn.ready = true;
+        // Resolve IMMEDIATELY on the 101 handshake. Previously we waited for the
+        // first data frame here, which deadlocked the tunnel whenever the bridge
+        // was slow to send telemetry -> browser hung forever ("stuck loading").
+        resolved = true;
+        clearTimeout(timer);
+        const rest = accBuf.subarray(idx + 4);
+        accBuf = Buffer.alloc(0);
+        if (rest.length) accBuf = wsDecodeFrames(rest, (op, p) => frameCbs.forEach(f => f(op, p)));
+        openCbs.forEach(cb => cb());
+        resolve(conn);
+      } else {
+        accBuf = wsDecodeFrames(Buffer.concat([accBuf, chunk]), (op, p) => {
+          if (op === 0x8) { conn.closed = true; closeCbs.forEach(cb => cb()); return; }
+          frameCbs.forEach(f => f(op, p));
+        });
+      }
+    });
+    sock.on("error", (e: any) => {
+      if (!resolved) { clearTimeout(timer); reject(e); }
+    });
+    sock.on("close", () => {
+      conn.ready = false;
+      if (!conn.closed) { conn.closed = true; closeCbs.forEach(cb => cb()); }
+    });
+  });
+}
+
 async function handleWsUpgrade(req: http.IncomingMessage, clientSocket: Duplex, head: Buffer, port: string) {
   // Only one live tunnel per port: browsers reconnecting after retries otherwise
   // pile up duplicate sockets against the single-connection Fabric IPC server.
   closeTunnelsForPort(port);
 
-  let connected = false;
+  let handshakeDone = false;
   try {
+    // Start probing/connecting the upstream without touching clientSocket yet;
+    // its data listener is attached only after the browser handshake completes.
     const base = await getWorkingBridgeBase(port);
     const wsUrl = base.replace(/^http/, "ws") + "/ws";
-    const upstream = new WebSocket(wsUrl as any);
-    connected = true;
+
+    // CRITICAL ORDERING: complete the browser handshake FIRST, then dial the
+    // bridge asynchronously. The previous order (await upstream before writing
+    // 101) left the browser socket hanging without any response for seconds on
+    // every reconnect -> "stuck loading". Now the tunnel opens instantly and
+    // buffers bridge frames even if they arrive before we finish connecting.
+    const secKey = req.headers["sec-websocket-key"];
+    if (!secKey) { try { clientSocket.destroy(); } catch {} return; }
+    const accept = require("crypto").createHash("sha1").update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    clientSocket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    handshakeDone = true;
+    let pending: Buffer = head && head.length > 0 ? Buffer.from(head) : Buffer.alloc(0);
 
     const entry: WsTunnelClient = { socket: clientSocket, buffer: Buffer.alloc(0), cleanup: () => {} };
     if (!wsTunnels.has(port)) wsTunnels.set(port, new Set());
     wsTunnels.get(port)!.add(entry);
 
-    const sendFrame = (payload: Buffer, opcode: number) => {
-      const len = payload.length;
-      let header: Buffer;
-      if (len < 126) {
-        header = Buffer.allocUnsafe(2);
-        header[1] = len;
-      } else if (len < 65536) {
-        header = Buffer.allocUnsafe(4);
-        header[1] = 126;
-        header.writeUInt16BE(len, 2);
-      } else {
-        header = Buffer.allocUnsafe(10);
-        header[1] = 127;
-        header.writeBigUInt64BE(BigInt(len), 2);
+    let upstream: UpstreamWsConn | null = null;
+
+    // Browser -> Bridge relay is wired IMMEDIATELY (before the bridge dial
+    // completes). The previous code attached these listeners only AFTER
+    // `await connectUpstreamWs(...)`, which meant frames the browser sent
+    // during that window were never consumed off the socket and the reverse
+    // direction silently stalled. Frames arriving before the bridge is up are
+    // buffered in `earlyFrames` and flushed on connect.
+    const earlyFrames: Array<{ opcode: number; payload: Buffer }> = [];
+    const onData = (chunk: Buffer) => {
+      pending = wsDecodeFrames(Buffer.concat([pending, chunk]), (opcode, payload) => {
+        if (opcode === 0x8) { try { upstream?.close(); } catch {} try { clientSocket.end(); } catch {} return; }
+        if (opcode === 0x9) { try { clientSocket.write(wsEncodeFrame(payload, 0xA)); } catch {} return; } // ping -> pong
+        if (!upstream) { earlyFrames.push({ opcode, payload }); return; }
+        if (opcode === 0x1) upstream.sendText(payload.toString("utf8"));
+        else if (opcode === 0x2) upstream.sendBinary(payload);
+      });
+    };
+    const onClose = () => {
+      entry.cleanup();
+      try { upstream?.close(); } catch {}
+    };
+    clientSocket.on("data", onData);
+    clientSocket.on("close", onClose);
+    clientSocket.on("error", onClose);
+
+    let conn: UpstreamWsConn;
+    try {
+      conn = await connectUpstreamWs(wsUrl);
+    } catch (err: any) {
+      console.warn(`[WS Tunnel] Failed to reach bridge :${port} - ${err?.message}`);
+      entry.cleanup();
+      // Close the browser WS cleanly so it retries instead of hanging forever
+      try { clientSocket.write(wsEncodeFrame(Buffer.from("bridge-unreachable", "utf8"), 0x8)); clientSocket.end(); } catch {}
+      return;
+    }
+    upstream = conn;
+    console.log(`[WS Tunnel] Browser <-> bridge :${port} established (${wsUrl})`);
+
+    // Flush any browser frames that arrived while we were still dialing the bridge
+    for (const f of earlyFrames.splice(0)) {
+      if (f.opcode === 0x1) conn.sendText(f.payload.toString("utf8"));
+      else if (f.opcode === 0x2) conn.sendBinary(f.payload);
+    }
+
+    // Bridge -> Browser: forward decoded frames as unmasked frames
+    conn.onFrame((opcode, payload) => {
+      if (opcode === 0x1 || opcode === 0x2 || opcode === 0x9) {
+        try { clientSocket.write(wsEncodeFrame(payload, opcode)); } catch {}
       }
-      header[0] = 0x80 | opcode; // FIN + opcode
-      try { clientSocket.write(Buffer.concat([header, payload])); } catch {}
-    };
-
-    // Complete the handshake with the browser manually (we own the raw socket now)
-    const crypto = require("crypto");
-    const secKey = req.headers["sec-websocket-key"];
-    if (!secKey) { clientSocket.destroy(); return; }
-    const accept = crypto.createHash("sha1").update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
-    clientSocket.write(
-      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
-      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
-    );
-    if (head && head.length > 0) entry.buffer = Buffer.concat([entry.buffer, head]);
-
-    upstream.onopen = () => {
-      console.log(`[WS Tunnel] Browser <-> bridge :${port} established (${wsUrl})`);
-    };
-    upstream.onmessage = (ev: any) => {
-      const data = ev.data;
-      if (typeof data === "string") sendFrame(Buffer.from(data, "utf8"), 0x1);
-      else if (data instanceof ArrayBuffer) sendFrame(Buffer.from(new Uint8Array(data)), 0x2);
-      else if (Buffer.isBuffer(data)) sendFrame(data, 0x2);
-    };
-    upstream.onerror = () => { try { clientSocket.end(); } catch {} };
-    upstream.onclose = () => {
+    });
+    conn.onClose(() => {
       entry.cleanup();
       try { clientSocket.end(); } catch {}
-    };
+    });
 
     entry.cleanup = () => {
       clientSocket.removeListener("data", onData);
@@ -1360,38 +1531,9 @@ async function handleWsUpgrade(req: http.IncomingMessage, clientSocket: Duplex, 
       clientSocket.removeListener("error", onClose);
       wsTunnels.get(port)?.delete(entry);
     };
-    const onData = (chunk: Buffer) => {
-      // Decode client (masked) frames and forward raw text/binary to upstream WS
-      let b = chunk;
-      while (b.length >= 2) {
-        const opcode = b[0] & 0x0f;
-        const maskedFlag = (b[1] & 0x80) !== 0;
-        let len = b[1] & 0x7f;
-        let offset = 2;
-        if (len === 126) { if (b.length < offset + 2) break; len = b.readUInt16BE(offset); offset += 2; }
-        else if (len === 127) { if (b.length < offset + 8) break; len = Number(b.readBigUInt64BE(offset)); offset += 8; }
-        let maskKey: Buffer | null = null;
-        if (maskedFlag) { if (b.length < offset + 4) break; maskKey = b.subarray(offset, offset + 4); offset += 4; }
-        if (b.length < offset + len) break;
-        const payload = Buffer.from(b.subarray(offset, offset + len));
-        if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
-        b = b.subarray(offset + len);
-        if (opcode === 0x8) { try { upstream.close(); } catch {} try { clientSocket.end(); } catch {} return; }
-        if ((opcode === 0x1 || opcode === 0x2) && upstream.readyState === 1) {
-          try { upstream.send(opcode === 0x1 ? payload.toString("utf8") : payload); } catch {}
-        }
-      }
-    };
-    const onClose = () => {
-      entry.cleanup();
-      try { upstream.close(); } catch {}
-    };
-    clientSocket.on("data", onData);
-    clientSocket.on("close", onClose);
-    clientSocket.on("error", onClose);
   } catch (err: any) {
     console.warn(`[WS Tunnel] Failed to reach bridge :${port} - ${err?.message}`);
-    if (!connected) {
+    if (!handshakeDone) {
       try {
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         clientSocket.end();
@@ -2961,8 +3103,30 @@ function startServer() {
     }
   });
 
-  app.listen(PORT, "0.0.0.0", () => {
+  const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Minecraft-AI-Bridge] Web Studio listening on http://0.0.0.0:${PORT}`);
+  });
+
+  // CRITICAL FIX: WebSocket upgrade requests NEVER pass through Express routes.
+  // The handleWsUpgrade() tunnel defined earlier was never wired to the HTTP
+  // server's 'upgrade' event, so every browser connection to
+  // /api/bridge/:port/ws hung forever -> dashboard stuck at "loading".
+  // This listener routes them into the raw-socket tunnel.
+  (server as any).on("upgrade", (req: any, socket: any, head: Buffer) => {
+    try {
+      const url = new URL(req.url || "/", "http://localhost");
+      const m = url.pathname.match(/^\/api\/bridge\/(\d+)\/ws\/?$/);
+      if (m) {
+        handleWsUpgrade(req, socket, head, m[1]);
+      } else {
+        // Unknown upgrade path - close cleanly instead of hanging
+        socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+        socket.destroy();
+      }
+    } catch (err: any) {
+      console.warn(`[WS Tunnel] Upgrade handler error: ${err?.message}`);
+      try { socket.destroy(); } catch {}
+    }
   });
 }
 
