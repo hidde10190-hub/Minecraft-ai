@@ -769,25 +769,21 @@ public class GameStateExporter {
         pose.addProperty("off_hand", offHand.isEmpty() ? "minecraft:air" : BuiltInRegistries.ITEM.getKey(offHand.getItem()).toString());
         root.add("player", pose);
 
-        // Inventory Overview (Limited to Hotbar + Armor for AI focus)
+        // FULL Inventory: every storage slot (main 0-35), armor and offhand.
+        // Previously only hotbar (0-8) + armor were exported, so the AI brain was blind
+        // to everything in the main inventory - it could not find building blocks or
+        // tools that were not already in the hotbar.
         JsonArray invArray = new JsonArray();
-        for (int i = 0; i < 9; i++) { // Hotbar
+        int invSize = player.getInventory().getContainerSize();
+        for (int i = 0; i < invSize; i++) {
             ItemStack stack = player.getInventory().getItem(i);
             if (!stack.isEmpty()) {
                 JsonObject itemObj = new JsonObject();
                 itemObj.addProperty("slot", i);
                 itemObj.addProperty("item", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
                 itemObj.addProperty("count", stack.getCount());
-                invArray.add(itemObj);
-            }
-        }
-        for (int i = 36; i < 40; i++) { // Armor
-            ItemStack stack = player.getInventory().getItem(i);
-            if (!stack.isEmpty()) {
-                JsonObject itemObj = new JsonObject();
-                itemObj.addProperty("slot", i);
-                itemObj.addProperty("item", BuiltInRegistries.ITEM.getKey(stack.getItem()).toString());
-                itemObj.addProperty("count", stack.getCount());
+                String region = i < 9 ? "hotbar" : (i < 36 ? "main" : (i < 40 ? "armor" : "offhand"));
+                itemObj.addProperty("region", region);
                 invArray.add(itemObj);
             }
         }

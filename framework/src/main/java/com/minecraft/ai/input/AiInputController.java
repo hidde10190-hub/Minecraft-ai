@@ -288,11 +288,13 @@ public class AiInputController {
     }
 
     /**
-     * Holds a virtual key for a specified tick count.
+     * Holds a virtual key for a specified tick count. Also mirrors the press into the
+     * OS-level uinput device when available (real hardware-grade keyboard events).
      */
     public void pressKey(String keyName, int durationTicks) {
         Minecraft client = Minecraft.getInstance();
         client.execute(() -> {
+            OsInputInjector.getInstance().pressKey(keyName);
             KeyMapping kb = resolveKeyBinding(client, keyName);
             if (kb != null) {
                 setKeyPressed(kb, true);
