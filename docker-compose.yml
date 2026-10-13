@@ -73,8 +73,11 @@ services:
     # On Docker Desktop for Windows the host kernel is WSL2, which already ships
     # the uinput module; if it reports "not found", run `modprobe uinput` once in
     # a "Ubuntu (WSL)" terminal. All of this degrades gracefully if unavailable.
-    devices:
-      - /dev/uinput:/dev/uinput
+    # NOTE: no hard `devices:` mapping for /dev/uinput here on purpose.
+    # If the host kernel doesn't expose /dev/uinput (some WSL2/Docker Desktop
+    # setups), a hard device mapping makes container startup fail outright.
+    # The entrypoint below creates it via mknod after loading the module,
+    # and OsInputInjector.java degrades gracefully if it stays unavailable.
     cap_add:
       - SYS_MODULE
     command: >
@@ -82,9 +85,11 @@ services:
                printf '#include <fcntl.h>\n#include <unistd.h>\n#include <sys/ioctl.h>\n#include <linux/uinput.h>\nint main(){int fd=open(\"/dev/uinput\",O_WRONLY);if(fd<0)return 1;return ioctl(fd,UI_DEV_CREATE,0)==0?0:2;}\n' > /tmp/ui.c && (gcc -o /usr/local/bin/uinput-create /tmp/ui.c 2>/dev/null || true) &&
                mkdir -p /app/framework/run/config &&
                (modprobe uinput 2>/dev/null || true) &&
+               ([ -e /dev/uinput ] || mknod /dev/uinput c 10 223 2>/dev/null || true) &&
                kill $(pgrep -f GradleDaemon) 2>/dev/null; kill $(pgrep GradleWorkerMain) 2>/dev/null; sleep 1;
                ./gradlew --stop > /dev/null 2>&1 || true;
-               rm -f /root/.gradle/caches/fabric-loom/*.lock /root/.gradle/caches/fabric-loom/**/*.lock 2>/dev/null; find /root/.gradle/caches/fabric-loom -name '*.lock' -delete 2>/dev/null; find /app/framework/.gradle -name '*.lock' -delete 2>/dev/null;
+               find /root/.gradle/caches/fabric-loom -name '*.lock' -delete 2>/dev/null; find /app/framework/.gradle -name '*.lock' -delete 2>/dev/null;
+               rm -rf /app/framework/build/tmp/compileJava 2>/dev/null;
                rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true &&
                Xvfb :99 -screen 0 1024x768x16 &
                export DISPLAY=:99 &&

@@ -63,7 +63,7 @@ def main():
         # Wipe stale Fabric Loom locks left by interrupted runs (fixes the
         # "Lock for cache='/root/.gradle/caches/fabric-loom' is currently held" hang)
         subprocess.run(["docker", "run", "--rm", "-v", "minecraft-gradle-cache:/g",
-                        "eclipse-temurin:25-jdk-noble", "bash", "-c",
+                        "alpine", "sh", "-c",
                         "find /g -name '*.lock' -delete"],
                        capture_output=True, cwd=root_dir)
         subprocess.run(["docker", "compose", "up", "-d", "--remove-orphans"], cwd=root_dir)

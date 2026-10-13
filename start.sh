@@ -51,7 +51,9 @@ if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "[Status] Launching containers..."
         # Wipe stale Fabric Loom locks left by interrupted runs (fixes the
     # "Lock for cache='/root/.gradle/caches/fabric-loom' is currently held" hang)
-    docker run --rm -v minecraft-gradle-cache:/g eclipse-temurin:25-jdk-noble bash -c "find /g -name '*.lock' -delete" >/dev/null 2>&1 || true
+    # alpine is used instead of a JDK image: it's tiny, pre-cached on most hosts,
+    # and find(1) is all we need.
+    docker run --rm -v minecraft-gradle-cache:/g alpine sh -c "find /g -name '*.lock' -delete" >/dev/null 2>&1 || true
 
 docker compose up -d --remove-orphans || {
         echo "[Warning] Compose failed. Pruning networks and retrying..."
