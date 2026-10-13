@@ -53,137 +53,186 @@ Example Response Format:
 
 
 class ModelAdapter:
-    """Unified interface for OpenAI, Anthropic, Gemini, and Ollama CLI/REST."""
+    """Unified JSON action-plan adapter for hosted and local chat APIs.
 
-    def __init__(self, provider: str = "ollama", model_name: str = "llama3:latest", api_key: Optional[str] = None):
-        self.provider = provider.lower()
-        self.model_name = model_name
-        self.api_key = api_key or os.environ.get(f"{provider.upper()}_API_KEY")
+    Native adapters are provided for Ollama, Gemini, OpenAI, and Anthropic.
+    OpenAI-compatible adapters use a configurable base URL, covering NVIDIA NIM,
+    OpenRouter, Groq, Together, DeepSeek, Mistral, Fireworks, xAI, and compatible
+    self-hosted endpoints without requiring a separate implementation per vendor.
+    """
+
+    OPENAI_COMPATIBLE_DEFAULTS = {
+        "nvidia": ("https://integrate.api.nvidia.com/v1", "NVIDIA_API_KEY", "NVIDIA_MODEL"),
+        "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "OPENROUTER_MODEL"),
+        "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY", "GROQ_MODEL"),
+        "together": ("https://api.together.xyz/v1", "TOGETHER_API_KEY", "TOGETHER_MODEL"),
+        "deepseek": ("https://api.deepseek.com/v1", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL"),
+        "mistral": ("https://api.mistral.ai/v1", "MISTRAL_API_KEY", "MISTRAL_MODEL"),
+        "fireworks": ("https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", "FIREWORKS_MODEL"),
+        "xai": ("https://api.x.ai/v1", "XAI_API_KEY", "XAI_MODEL"),
+        "perplexity": ("https://api.perplexity.ai", "PERPLEXITY_API_KEY", "PERPLEXITY_MODEL"),
+        "cerebras": ("https://api.cerebras.ai/v1", "CEREBRAS_API_KEY", "CEREBRAS_MODEL"),
+        "sambanova": ("https://api.sambanova.ai/v1", "SAMBANOVA_API_KEY", "SAMBANOVA_MODEL"),
+        "deepinfra": ("https://api.deepinfra.com/v1/openai", "DEEPINFRA_API_KEY", "DEEPINFRA_MODEL"),
+        "ovhcloud": ("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", "OVHCLOUD_API_KEY", "OVHCLOUD_MODEL"),
+        "custom_openai": ("http://localhost:8000/v1", "CUSTOM_OPENAI_API_KEY", "CUSTOM_OPENAI_MODEL"),
+    }
+
+    def __init__(self, provider: str = "ollama", model_name: Optional[str] = None, api_key: Optional[str] = None):
+        self.provider = provider.lower().strip()
+        self.api_key = api_key or os.environ.get(f"{self.provider.upper()}_API_KEY")
+        self.base_url = (
+            os.environ.get(f"{self.provider.upper()}_BASE_URL")
+            or os.environ.get("OPENAI_COMPATIBLE_BASE_URL")
+        )
+        self.model_name = model_name or os.environ.get(f"{self.provider.upper()}_MODEL")
+
+        if self.provider in self.OPENAI_COMPATIBLE_DEFAULTS:
+            default_url, key_env, model_env = self.OPENAI_COMPATIBLE_DEFAULTS[self.provider]
+            self.base_url = self.base_url or os.environ.get(key_env.replace("_API_KEY", "_BASE_URL")) or default_url
+            self.api_key = self.api_key or os.environ.get(key_env)
+            self.model_name = self.model_name or os.environ.get(model_env)
+
+        if self.provider == "ollama":
+            self.model_name = self.model_name or "llama3:latest"
+        elif self.provider == "gemini":
+            self.model_name = self.model_name or os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        elif self.provider == "openai":
+            self.model_name = self.model_name or os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+        elif self.provider == "anthropic":
+            self.model_name = self.model_name or os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
     async def generate_action_plan(self, telemetry: Dict[str, Any], goal: str, memory_summary: str, litematica_diff: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         user_prompt = self._build_prompt(telemetry, goal, memory_summary, litematica_diff)
-
         if self.provider == "ollama":
             return await self._call_ollama(user_prompt)
-        elif self.provider == "gemini":
+        if self.provider == "gemini":
             return await self._call_gemini(user_prompt)
-        elif self.provider == "openai":
+        if self.provider == "openai":
             return await self._call_openai(user_prompt)
-        elif self.provider == "anthropic":
+        if self.provider == "anthropic":
             return await self._call_anthropic(user_prompt)
-        else:
-            raise ValueError(f"Unsupported provider: {self.provider}")
+        if self.provider in self.OPENAI_COMPATIBLE_DEFAULTS or self.base_url:
+            return await self._call_openai_compatible(user_prompt)
+        raise ValueError(f"Unsupported provider: {self.provider}. Supported: {', '.join(sorted(set(self.OPENAI_COMPATIBLE_DEFAULTS) | {'ollama', 'gemini', 'openai', 'anthropic'}))}")
 
     def _build_prompt(self, telemetry: Dict[str, Any], goal: str, memory_summary: str, diff: Optional[Dict[str, Any]]) -> str:
         player = telemetry.get("player", {})
         raycast = telemetry.get("raycast", {})
         nearby = telemetry.get("nearby_entities", [])
-
         payload = {
             "current_goal": goal,
             "player_state": {
                 "pos": [player.get("x"), player.get("y"), player.get("z")],
-                "yaw": player.get("yaw"),
-                "pitch": player.get("pitch"),
-                "health": player.get("health"),
-                "food": player.get("food"),
-                "selected_slot": player.get("selected_slot"),
-                "hotbar": player.get("hotbar", [])
+                "yaw": player.get("yaw"), "pitch": player.get("pitch"),
+                "health": player.get("health"), "food": player.get("food"),
+                "selected_slot": player.get("selected_slot"), "hotbar": player.get("hotbar", [])
             },
             "crosshair_target": raycast,
             "nearby_entities": nearby[:5],
             "recent_actions": memory_summary,
             "litematica_diff": diff.get("diffs", [])[:5] if diff else []
         }
-
-        return f"Current World Telemetry and Goal Context:\n```json\n{json.dumps(payload, indent=2)}\n```\nDecide next actions. Return ONLY valid JSON."
+        return f"Current World Telemetry and Goal Context:\n\x60\x60\x60json\n{json.dumps(payload, indent=2)}\n\x60\x60\x60\nDecide next actions. Return ONLY valid JSON."
 
     async def _call_ollama(self, user_prompt: str) -> Dict[str, Any]:
-        """Calls local Ollama instance via REST or CLI subprocess."""
         ollama_url = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/generate")
         try:
             async with aiohttp.ClientSession() as session:
-                body = {
-                    "model": self.model_name,
-                    "system": SYSTEM_PROMPT,
-                    "prompt": user_prompt,
-                    "format": "json",
-                    "stream": False
-                }
-                async with session.post(ollama_url, json=body, timeout=aiohttp.ClientTimeout(total=20)) as resp:
-                    if resp.status == 200:
-                        res = await resp.json()
-                        return json.loads(res.get("response", "{}"))
+                body = {"model": self.model_name, "system": SYSTEM_PROMPT, "prompt": user_prompt, "format": "json", "stream": False}
+                async with session.post(ollama_url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    data = await resp.json()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"Ollama HTTP {resp.status}: {str(data)[:500]}")
+                    return self._parse_json_safely(data.get("response", "{}"))
         except Exception as e:
-            print(f"[ModelAdapter] Ollama REST failed ({e}), falling back to CLI subprocess...")
-            # Fallback to Ollama CLI: `ollama run <model>`
+            print(f"[ModelAdapter] Ollama REST failed ({e}); trying CLI fallback.")
             process = await asyncio.create_subprocess_exec(
                 "ollama", "run", self.model_name, f"{SYSTEM_PROMPT}\n{user_prompt}",
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
-            stdout, _ = await process.communicate()
-            return self._parse_json_safely(stdout.decode("utf-8"))
+            stdout, stderr = await process.communicate()
+            if process.returncode:
+                raise RuntimeError(f"Ollama REST and CLI failed: {stderr.decode('utf-8', errors='replace')[:500]}") from e
+            return self._parse_json_safely(stdout.decode("utf-8", errors="replace"))
 
     async def _call_gemini(self, user_prompt: str) -> Dict[str, Any]:
-        """Calls Google Gemini API."""
         api_key = self.api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable required")
-        
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={api_key}"
-        body = {
-            "contents": [{"parts": [{"text": f"{SYSTEM_PROMPT}\n\n{user_prompt}"}]}],
-            "generationConfig": {"responseMimeType": "application/json"}
-        }
+        body = {"systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [{"parts": [{"text": user_prompt}]}],
+                "generationConfig": {"responseMimeType": "application/json"}}
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body) as resp:
+            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 data = await resp.json()
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-                return json.loads(text)
+                if resp.status >= 400:
+                    raise RuntimeError(f"Gemini HTTP {resp.status}: {str(data)[:500]}")
+                try:
+                    return self._parse_json_safely(data["candidates"][0]["content"]["parts"][0]["text"])
+                except (KeyError, IndexError, TypeError) as e:
+                    raise RuntimeError(f"Gemini returned an unexpected response: {str(data)[:500]}") from e
 
     async def _call_openai(self, user_prompt: str) -> Dict[str, Any]:
-        """Calls OpenAI Chat Completion API."""
-        api_key = self.api_key or os.environ.get("OPENAI_API_KEY")
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        return await self._post_openai_compatible(
+            "https://api.openai.com/v1", self.api_key or os.environ.get("OPENAI_API_KEY"),
+            self.model_name, user_prompt, provider_label="OpenAI"
+        )
+
+    async def _call_openai_compatible(self, user_prompt: str) -> Dict[str, Any]:
+        if not self.base_url:
+            raise ValueError(f"{self.provider} requires a base URL")
+        if not self.api_key and self.provider != "custom_openai":
+            raise ValueError(f"{self.provider.upper()}_API_KEY environment variable required")
+        return await self._post_openai_compatible(self.base_url, self.api_key, self.model_name, user_prompt, provider_label=self.provider)
+
+    async def _post_openai_compatible(self, base_url: str, api_key: Optional[str], model: Optional[str], user_prompt: str, provider_label: str) -> Dict[str, Any]:
+        if not model:
+            raise ValueError(f"Set {self.provider.upper()}_MODEL to a model ID supported by {provider_label}")
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if self.provider == "openrouter":
+            headers["HTTP-Referer"] = os.environ.get("OPENROUTER_HTTP_REFERER", "https://github.com/hidde10190-hub/Minecraft-ai")
+            headers["X-OpenRouter-Title"] = os.environ.get("OPENROUTER_APP_TITLE", "Minecraft AI")
         body = {
-            "model": self.model_name or "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt}
-            ],
-            "response_format": {"type": "json_object"}
+            "model": model,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_prompt}],
+            "response_format": {"type": "json_object"},
         }
+        url = base_url.rstrip("/") + "/chat/completions"
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=body) as resp:
-                data = await resp.json()
-                content = data["choices"][0]["message"]["content"]
-                return json.loads(content)
+            async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                data = await resp.json(content_type=None)
+                if resp.status >= 400:
+                    raise RuntimeError(f"{provider_label} HTTP {resp.status}: {str(data)[:500]}")
+                try:
+                    content = data["choices"][0]["message"]["content"]
+                except (KeyError, IndexError, TypeError) as e:
+                    raise RuntimeError(f"{provider_label} returned an unexpected response: {str(data)[:500]}") from e
+                return self._parse_json_safely(content)
 
     async def _call_anthropic(self, user_prompt: str) -> Dict[str, Any]:
-        """Calls Anthropic Claude API."""
         api_key = self.api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY environment variable required")
         url = "https://api.anthropic.com/v1/messages"
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        body = {
-            "model": self.model_name or "claude-3-5-sonnet-20241022",
-            "max_tokens": 1024,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_prompt}]
-        }
+        headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        body = {"model": self.model_name, "max_tokens": 2048, "system": SYSTEM_PROMPT,
+                "messages": [{"role": "user", "content": user_prompt}]}
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=headers, json=body) as resp:
+            async with session.post(url, headers=headers, json=body, timeout=aiohttp.ClientTimeout(total=60)) as resp:
                 data = await resp.json()
-                content = data["content"][0]["text"]
-                return self._parse_json_safely(content)
+                if resp.status >= 400:
+                    raise RuntimeError(f"Anthropic HTTP {resp.status}: {str(data)[:500]}")
+                try:
+                    return self._parse_json_safely(data["content"][0]["text"])
+                except (KeyError, IndexError, TypeError) as e:
+                    raise RuntimeError(f"Anthropic returned an unexpected response: {str(data)[:500]}") from e
 
     def _parse_json_safely(self, text: str) -> Dict[str, Any]:
         try:
-            # Strip potential markdown formatting
             cleaned = text.strip()
             if cleaned.startswith("```json"):
                 cleaned = cleaned[7:]
@@ -191,9 +240,12 @@ class ModelAdapter:
                 cleaned = cleaned[3:]
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
-            return json.loads(cleaned.strip())
-        except Exception:
-            return {"thought": "Fallback parse", "actions": []}
+            parsed = json.loads(cleaned.strip())
+            if not isinstance(parsed, dict) or not isinstance(parsed.get("actions", []), list):
+                raise ValueError("Model response must be a JSON object with an actions list")
+            return parsed
+        except Exception as e:
+            raise ValueError(f"Model returned invalid action-plan JSON: {e}") from e
 
 
 class MinecraftAiOrchestrator:
