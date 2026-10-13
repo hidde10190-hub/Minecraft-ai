@@ -29,6 +29,16 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 // the dashboard replied with an HTML error page, breaking res.json() on the client.
 app.use(express.json({ limit: "25mb" }));
 
+// DIAGNOSTIC REQUEST LOGGER: prints every request + response status/time so that
+// "stuck loading" issues can be traced from `docker compose logs minecraft-ai-dashboard`.
+app.use((req, res, next) => {
+  const t0 = Date.now();
+  res.on("finish", () => {
+    console.log(`[HTTP] ${req.method} ${req.originalUrl} -> ${res.statusCode} (${Date.now() - t0}ms)`);
+  });
+  next();
+});
+
 // Helper for VarInt encoding in Minecraft protocol
 function writeVarInt(value: number): Buffer {
   const buffer: number[] = [];
@@ -1256,16 +1266,139 @@ app.get("/api/bridge/status", async (req, res) => {
 // WebSocket upgrade proxy: browser dashboard -> dashboard server -> Fabric client IPC.
 // The browser cannot open ws://localhost:<botPort> directly when the dashboard is
 // served from a container-mapped port, so /api/bridge/:port/ws is tunneled here.
-import httpProxyPkg from "http-proxy";
-const httpProxy = (httpProxyPkg as any).default ?? httpProxyPkg;
-const wsProxy = httpProxy.createProxyServer({ ws: true });
-wsProxy.on("error", (err: any) => { /* client/bot disconnected - ignore */ });
-app.get("/api/bridge/:port/ws", (req, res) => {
-  const port = req.params.port;
-  wsProxy.ws(req, res, { target: `http://127.0.0.1:${port}`, changeOrigin: true }, (err) => {
-    res.status(502).end(`WebSocket bridge unavailable on port ${port}`);
-  });
-});
+//
+// IMPORTANT: this must be handled at the raw HTTP 'upgrade' event level. Express
+// routes never see upgrade requests, and the previous route-level http-proxy.ws()
+// call passed an OutgoingMessage instead of a net.Socket, throwing
+// "TypeError: socket.setNoDelay is not a function" and breaking the live telemetry
+// pipe (dashboard stuck loading). We use Node's built-in WebSocket client (Node 22+)
+// to tunnel frames between the browser socket and the Fabric bridge - zero deps.
+import * as http from "http";
+import type { Duplex } from "stream";
+
+interface WsTunnelClient {
+  socket: Duplex;
+  buffer: Buffer;
+  cleanup: () => void;
+}
+const wsTunnels = new Map<string, Set<WsTunnelClient>>();
+
+function closeTunnelsForPort(port: string) {
+  const set = wsTunnels.get(port);
+  if (!set) return;
+  for (const c of set) {
+    try { c.cleanup(); } catch {}
+    try { c.socket.destroy(); } catch {}
+  }
+  wsTunnels.delete(port);
+}
+
+async function handleWsUpgrade(req: http.IncomingMessage, clientSocket: Duplex, head: Buffer, port: string) {
+  // Only one live tunnel per port: browsers reconnecting after retries otherwise
+  // pile up duplicate sockets against the single-connection Fabric IPC server.
+  closeTunnelsForPort(port);
+
+  let connected = false;
+  try {
+    const base = await getWorkingBridgeBase(port);
+    const wsUrl = base.replace(/^http/, "ws") + "/ws";
+    const upstream = new WebSocket(wsUrl as any);
+    connected = true;
+
+    const entry: WsTunnelClient = { socket: clientSocket, buffer: Buffer.alloc(0), cleanup: () => {} };
+    if (!wsTunnels.has(port)) wsTunnels.set(port, new Set());
+    wsTunnels.get(port)!.add(entry);
+
+    const sendFrame = (payload: Buffer, opcode: number) => {
+      const len = payload.length;
+      let header: Buffer;
+      if (len < 126) {
+        header = Buffer.allocUnsafe(2);
+        header[1] = len;
+      } else if (len < 65536) {
+        header = Buffer.allocUnsafe(4);
+        header[1] = 126;
+        header.writeUInt16BE(len, 2);
+      } else {
+        header = Buffer.allocUnsafe(10);
+        header[1] = 127;
+        header.writeBigUInt64BE(BigInt(len), 2);
+      }
+      header[0] = 0x80 | opcode; // FIN + opcode
+      try { clientSocket.write(Buffer.concat([header, payload])); } catch {}
+    };
+
+    // Complete the handshake with the browser manually (we own the raw socket now)
+    const crypto = require("crypto");
+    const secKey = req.headers["sec-websocket-key"];
+    if (!secKey) { clientSocket.destroy(); return; }
+    const accept = crypto.createHash("sha1").update(secKey + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
+    clientSocket.write(
+      "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+    );
+    if (head && head.length > 0) entry.buffer = Buffer.concat([entry.buffer, head]);
+
+    upstream.onopen = () => {
+      console.log(`[WS Tunnel] Browser <-> bridge :${port} established (${wsUrl})`);
+    };
+    upstream.onmessage = (ev: any) => {
+      const data = ev.data;
+      if (typeof data === "string") sendFrame(Buffer.from(data, "utf8"), 0x1);
+      else if (data instanceof ArrayBuffer) sendFrame(Buffer.from(new Uint8Array(data)), 0x2);
+      else if (Buffer.isBuffer(data)) sendFrame(data, 0x2);
+    };
+    upstream.onerror = () => { try { clientSocket.end(); } catch {} };
+    upstream.onclose = () => {
+      entry.cleanup();
+      try { clientSocket.end(); } catch {}
+    };
+
+    entry.cleanup = () => {
+      clientSocket.removeListener("data", onData);
+      clientSocket.removeListener("close", onClose);
+      clientSocket.removeListener("error", onClose);
+      wsTunnels.get(port)?.delete(entry);
+    };
+    const onData = (chunk: Buffer) => {
+      // Decode client (masked) frames and forward raw text/binary to upstream WS
+      let b = chunk;
+      while (b.length >= 2) {
+        const opcode = b[0] & 0x0f;
+        const maskedFlag = (b[1] & 0x80) !== 0;
+        let len = b[1] & 0x7f;
+        let offset = 2;
+        if (len === 126) { if (b.length < offset + 2) break; len = b.readUInt16BE(offset); offset += 2; }
+        else if (len === 127) { if (b.length < offset + 8) break; len = Number(b.readBigUInt64BE(offset)); offset += 8; }
+        let maskKey: Buffer | null = null;
+        if (maskedFlag) { if (b.length < offset + 4) break; maskKey = b.subarray(offset, offset + 4); offset += 4; }
+        if (b.length < offset + len) break;
+        const payload = Buffer.from(b.subarray(offset, offset + len));
+        if (maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+        b = b.subarray(offset + len);
+        if (opcode === 0x8) { try { upstream.close(); } catch {} try { clientSocket.end(); } catch {} return; }
+        if ((opcode === 0x1 || opcode === 0x2) && upstream.readyState === 1) {
+          try { upstream.send(opcode === 0x1 ? payload.toString("utf8") : payload); } catch {}
+        }
+      }
+    };
+    const onClose = () => {
+      entry.cleanup();
+      try { upstream.close(); } catch {}
+    };
+    clientSocket.on("data", onData);
+    clientSocket.on("close", onClose);
+    clientSocket.on("error", onClose);
+  } catch (err: any) {
+    console.warn(`[WS Tunnel] Failed to reach bridge :${port} - ${err?.message}`);
+    if (!connected) {
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        clientSocket.end();
+      } catch {}
+    }
+  }
+}
 
 // Proxy REST API and actions to Minecraft Bridge
 app.all("/api/bridge/:port/*", async (req, res) => {
