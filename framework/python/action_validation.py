@@ -19,7 +19,7 @@ ALLOWED_ACTIONS = {
     "save_landmark", "send_chat",
 }
 ALLOWED_KEYS = {
-    "forward", "back", "left", "right", "jump", "sneak", "sprint",
+    "forward", "back", "left", "right", "w", "s", "a", "d", "jump", "sneak", "sprint",
     "attack", "use", "inventory", "drop", "swapHands", "pickBlock",
     "escape", "enter", "space", "shift", "control", "alt",
 }
@@ -80,7 +80,7 @@ def validate_action(action: Any) -> Dict[str, Any]:
     elif kind == "place_block":
         for axis in ("x", "y", "z"):
             _integer(action.get(axis), axis, low=-MAX_COORDINATE, high=MAX_COORDINATE)
-        face = action.get("face")
+        face = action.get("face", action.get("side"))
         if face is not None and face not in {"up", "down", "north", "south", "east", "west"}:
             raise ActionValidationError("face must be a cardinal block face")
         hand = action.get("hand")
