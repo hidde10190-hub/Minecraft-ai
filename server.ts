@@ -3015,11 +3015,17 @@ function startServer() {
     }
   }
 
-  app.use(express.static(distPath));
+  app.use(express.static(distPath, { etag: false, lastModified: false, maxAge: 0, setHeaders: (res) => {
+    // NEVER let the browser cache index.html or stale hashed assets. This fixes
+    // the "stuck loading" symptom where a browser held onto an old index.html
+    // pointing at asset filenames that no longer exist after a rebuild.
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+  }}));
   // SPA fallback for any non-API GET request. Express 5 requires named wildcards.
   app.get("*", (req, res) => {
     const indexFile = path.join(distPath, "index.html");
     if (fs.existsSync(indexFile)) {
+      res.setHeader("Cache-Control", "no-store, must-revalidate");
       res.sendFile(indexFile);
     } else {
       res.status(503).send("Dashboard not built yet.");
