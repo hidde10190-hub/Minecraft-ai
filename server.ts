@@ -1455,37 +1455,67 @@ app.all(["/api/status", "/api/state", "/api/chat", "/api/action"], async (req, r
 });
 
 // Router Status Endpoint: Telemetry across all tiers
-app.get("/api/ai/router-status", (req, res) => {
+app.get("/api/ai/router-status", async (req, res) => {
   const hasNvidiaKey = !!process.env.NVIDIA_API_KEY;
   const hasGeminiKey = !!process.env.GEMINI_API_KEY;
   const defaultNvidiaModel = process.env.NVIDIA_MODEL || "meta/llama-3.2-11b-vision-instruct";
   const defaultNvidiaUrl = process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+  const defaultGeminiModel = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+  const defaultOllamaModel = process.env.OLLAMA_MODEL || "qwen2.5vl:3b";
+  const configuredProvider = (process.env.AI_PROVIDER || "auto").toLowerCase();
+  const configuredPriority = (process.env.AI_PROVIDER_PRIORITY || "nvidia,gemini,ollama").split(",").map((s: string) => s.trim()).filter(Boolean);
+
+  // Probe Ollama liveness (short timeout so the dashboard never hangs)
+  let ollamaAvailable = false;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 1500);
+    const probe = await fetch(`${ollamaBaseUrl.replace(/\/$/, "")}/api/tags`, { signal: ctrl.signal });
+    clearTimeout(t);
+    ollamaAvailable = probe.ok;
+  } catch {
+    ollamaAvailable = false;
+  }
 
   res.json({
     defaultModel: defaultNvidiaModel,
     defaultUrl: defaultNvidiaUrl,
-    preferredProvider: "nvidia",
+    preferredProvider: configuredProvider,
+    providerPriority: configuredPriority,
     activeStrategy: "Autonomous Multi-Tier Failover",
     tier1: {
       provider: "nvidia",
       name: `NVIDIA NIM (${defaultNvidiaModel})`,
+      model: defaultNvidiaModel,
       available: hasNvidiaKey,
-      status: hasNvidiaKey ? `Online @ ${(() => { try { return new URL(defaultNvidiaUrl).hostname; } catch { return "Custom Endpoint"; } })()}` : "Simulated TensorRT (Add NVIDIA_API_KEY)",
-      hardwareTarget: "NVIDIA TensorRT-LLM Cloud"
+      status: hasNvidiaKey ? `Online @ ${(() => { try { return new URL(defaultNvidiaUrl).hostname; } catch { return "Custom Endpoint"; } })()}` : "No API key (add NVIDIA_API_KEY)",
+      hardwareTarget: "NVIDIA NIM Cloud / TensorRT-LLM"
     },
     tier2: {
       provider: "gemini",
-      name: "Google Gemini 3.8 Flash",
+      name: `Google Gemini (${defaultGeminiModel})`,
+      model: defaultGeminiModel,
       available: hasGeminiKey,
-      status: hasGeminiKey ? "Online & Standby (Rate Limited)" : "Standby (Key not set)",
+      status: hasGeminiKey ? "Online & Standby (Rate Limited)" : "Standby (GEMINI_API_KEY not set)",
       hardwareTarget: "DeepMind Cloud TPU"
     },
     tier3: {
+      provider: "ollama",
+      name: `Local Ollama (${defaultOllamaModel})`,
+      model: defaultOllamaModel,
+      baseUrl: ollamaBaseUrl,
+      available: ollamaAvailable,
+      status: ollamaAvailable ? `Reachable @ ${ollamaBaseUrl}` : "Offline (Ollama not reachable)",
+      hardwareTarget: "Local CPU/GPU inference"
+    },
+    tier4: {
       provider: "builtin",
-      name: "Built-in Ultra-Efficient Neuro-Symbolic Engine",
+      name: "Built-in Neuro-Symbolic Engine",
+      model: "builtin-solver",
       available: true,
       status: "Always Active (0ms Latency, 100% Offline)",
-      hardwareTarget: "In-Process CPU / SIMD"
+      hardwareTarget: "In-Process Node.js"
     }
   });
 });
@@ -1986,7 +2016,7 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
     } else {
       const ai = getGeminiClient(geminiKey);
       if (ai) {
-        const preferredGeminiModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-3.8-flash";
+        const preferredGeminiModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-2.5-flash";
         const candidateGeminiModels = [
           preferredGeminiModel,
           "gemini-2.5-flash",
@@ -2679,14 +2709,15 @@ app.post("/api/ai/vision-describe", async (req, res) => {
 
   const provider = preferredProvider || process.env.AI_PROVIDER || "auto";
 
-  // Tier 1: Gemini 3.8 Flash Vision (Instant Multimodal DeepMind)
+  // Tier 1: Gemini Flash Vision (Multimodal) — model from GEMINI_MODEL in config.env
   if (provider === "auto" || provider === "gemini") {
     const geminiKey = apiKeyOverrides.gemini || process.env.GEMINI_API_KEY;
     const ai = getGeminiClient(geminiKey);
+    const visionModel = apiKeyOverrides.geminiModel || process.env.GEMINI_MODEL || "gemini-2.5-flash";
     if (ai) {
       try {
         const response = await ai.models.generateContent({
-          model: "gemini-3.8-flash",
+          model: visionModel,
           contents: [
             { inlineData: { data: cleanBase64, mimeType: "image/jpeg" } },
             { text: defaultPrompt }
@@ -2695,7 +2726,7 @@ app.post("/api/ai/vision-describe", async (req, res) => {
         const visualSummary = response.text || "";
         return res.json({
           provider: "gemini",
-          model: "gemini-3.8-flash",
+          model: visionModel,
           visualSummary,
           latencyMs: Date.now() - startTime
         });

@@ -103,9 +103,9 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
   activeAgentRole = "Assistant",
   activeAgentName = "Gemini",
   activeAgent,
-  nvidiaModel = "meta/llama-3.3-70b-instruct",
+  nvidiaModel = "meta/llama-3.2-11b-vision-instruct",
   onSelectNvidiaModel,
-  ollamaModel = "qwen2.5-coder:7b",
+  ollamaModel = "qwen2.5vl:3b",
   onSelectOllamaModel,
   ollamaBaseUrl = "http://127.0.0.1:11434",
   onUpdateOllamaBaseUrl,
@@ -499,7 +499,7 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 <span className="text-[9px] px-1 rounded bg-black/30">0ms</span>
               </button>
 
-              {/* NVIDIA NVAPI Button */}
+              {/* NVIDIA NIM Button */}
               <button
                 onClick={() => setProvider("nvidia")}
                 className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-mono transition-all ${
@@ -507,11 +507,10 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                     ? "bg-emerald-500 text-slate-950 font-bold shadow-sm"
                     : "text-slate-400 hover:text-slate-200"
                 }`}
-                title="NVIDIA NVAPI & Cloud NIM (TensorRT-LLM, Llama-3.3, Nemotron)"
+                title="NVIDIA NIM Cloud Inference (Llama 3.x / Nemotron via integrate.api.nvidia.com)"
               >
                 <Cpu className="h-3.5 w-3.5" />
-                <span>NVIDIA NVAPI</span>
-                <span className="text-[9px] px-1 rounded bg-black/30">RTX</span>
+                <span>NVIDIA NIM</span>
               </button>
 
               {/* Gemini Button */}
@@ -522,10 +521,10 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                     ? "bg-emerald-600 text-slate-950 font-bold shadow-sm"
                     : "text-slate-400 hover:text-slate-200"
                 }`}
-                title="Google Gemini 3.8 Flash DeepMind Cloud"
+                title="Google Gemini Cloud (model configured via GEMINI_MODEL in config.env)"
               >
                 <Sparkles className="h-3.5 w-3.5" />
-                <span>Gemini 3.8</span>
+                <span>Gemini</span>
               </button>
 
               {/* Ollama Button */}
@@ -536,9 +535,9 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                     ? "bg-orange-600 text-slate-950 font-bold shadow-sm"
                     : "text-slate-400 hover:text-slate-200"
                 }`}
-                title="Local/Web Ollama Engine (High-speed hardware acceleration)"
+                title="Local Ollama Engine (any pulled model, auto-discovered)"
               >
-                Ollama CLI
+                Ollama
               </button>
             </div>
           </div>
@@ -562,7 +561,7 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    NVIDIA Llama-3.3-70B primary engine with failover to Gemini 3.8, Local Ollama, and Built-in reserve
+                    Failover chain driven by <code className="text-slate-300">AI_PROVIDER_PRIORITY</code> in config.env: NVIDIA NIM → Gemini → Local Ollama → Built-in reserve
                   </p>
                 </div>
               </div>
@@ -595,7 +594,11 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 <div>
                   <span className="text-slate-400 text-[10px] block">CURRENT ACTIVE PIPELINE</span>
                   <span className="text-emerald-300 font-bold">
-                    {routerMetrics?.routingPath || "Tier 1: NVIDIA Cloud NIM (meta/llama-3.3-70b-instruct)"}
+                    {routerMetrics?.routingPath || (routerHealth?.tier1?.available
+                      ? `Tier 1: ${routerHealth.tier1.name}`
+                      : routerHealth?.tier2?.available
+                      ? `Tier 2: ${routerHealth.tier2.name}`
+                      : "Tier 4: Built-in Neuro-Symbolic Engine")}
                   </span>
                 </div>
               </div>
@@ -607,84 +610,40 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                   </span>
                 )}
                 <span className="px-2.5 py-1 rounded bg-black/40 text-slate-200 font-bold border border-slate-800">
-                  Latency: {routerMetrics?.latencyMs ?? 14}ms
+                  Latency: {routerMetrics?.latencyMs ?? "—"}ms
                 </span>
               </div>
             </div>
 
-            {/* 3 Tier Architectural Cascade Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-mono">
-              {/* Tier 1 Card */}
-              <div className="p-3 rounded-lg bg-slate-900/90 border border-emerald-800/60 relative overflow-hidden">
-                <div className="absolute top-0 right-0 px-2 py-0.5 rounded-bl bg-emerald-950 text-emerald-400 text-[9px] font-bold border-l border-b border-emerald-800">
-                  PRIMARY TIER
+            {/* Live Tier Cascade Grid (sourced from /api/ai/router-status) */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs font-mono">
+              {[
+                { tier: routerHealth?.tier1, label: "PRIMARY", accent: "emerald", icon: <Cpu className="h-4 w-4 text-emerald-400" />, desc: "Cloud inference via NVIDIA NIM endpoints." },
+                { tier: routerHealth?.tier2, label: "FAILOVER", accent: "cyan", icon: <Sparkles className="h-4 w-4 text-cyan-400" />, desc: "Engages if Tier 1 is keyless, rate-limited, or offline." },
+                { tier: routerHealth?.tier3, accent: "orange", label: "LOCAL", icon: <Radio className="h-4 w-4 text-orange-400" />, desc: "Self-hosted Ollama probe; no internet required." },
+                { tier: routerHealth?.tier4, accent: "amber", label: "RESERVE", icon: <Zap className="h-4 w-4 text-amber-400" />, desc: "Deterministic in-process solver. Never fails." },
+              ].map(({ tier, label, accent, icon, desc }, idx) => (
+                <div key={idx} className={`p-3 rounded-lg bg-slate-900/90 border border-${accent}-800/60 relative overflow-hidden`}>
+                  <div className={`absolute top-0 right-0 px-2 py-0.5 rounded-bl bg-${accent}-950 text-${accent}-400 text-[9px] font-bold border-l border-b border-${accent}-800`}>
+                    TIER {idx + 1}: {label}
+                  </div>
+                  <div className="flex items-center gap-2 mb-2">{icon}<span className="font-bold text-slate-200">{tier?.name || `Loading tier ${idx + 1}...`}</span></div>
+                  <div className={`text-[11px] text-${accent}-400 font-bold mb-1 break-all`}>{tier?.model || "—"}</div>
+                  <p className="text-[10px] text-slate-400 mb-2">{desc}</p>
+                  <div className="flex items-center justify-between gap-2 text-[10px] pt-2 border-t border-slate-800/80">
+                    <span className={`shrink-0 inline-flex items-center gap-1 font-semibold ${tier?.available ? "text-emerald-400" : "text-slate-500"}`}>
+                      <span className={`h-1.5 w-1.5 rounded-full ${tier?.available ? "bg-emerald-400" : "bg-slate-600"}`} />
+                      {tier?.available ? "Available" : "Unavailable"}
+                    </span>
+                    <span className={`text-${accent}-400 text-right truncate`}>{tier?.status || "Querying..."}</span>
+                  </div>
                 </div>
-                <div className="flex items-center gap-2 mb-2">
-                  <Cpu className="h-4 w-4 text-emerald-400" />
-                  <span className="font-bold text-slate-200">Tier 1: NVIDIA NIM</span>
-                </div>
-                <div className="text-[11px] text-emerald-400 font-bold mb-1">
-                  meta/llama-3.3-70b-instruct
-                </div>
-                <p className="text-[10px] text-slate-400 mb-2">
-                  High-capacity 70B parameter model via TensorRT-LLM on RTX 4090/5090 NVAPI.
-                </p>
-                <div className="flex items-center justify-between text-[10px] pt-2 border-t border-slate-800/80">
-                  <span className="text-slate-500">Latency: ~15-30ms</span>
-                  <span className="text-emerald-400 font-semibold">
-                    {routerHealth?.tier1?.status || "Ready (NVIDIA NIM)"}
-                  </span>
-                </div>
-              </div>
-
-              {/* Tier 2 Card */}
-              <div className="p-3 rounded-lg bg-slate-900/90 border border-cyan-800/60 relative overflow-hidden">
-                <div className="absolute top-0 right-0 px-2 py-0.5 rounded-bl bg-cyan-950 text-cyan-400 text-[9px] font-bold border-l border-b border-cyan-800">
-                  FAILOVER TIER
-                </div>
-                <div className="flex items-center gap-2 mb-2">
-                  <Sparkles className="h-4 w-4 text-cyan-400" />
-                  <span className="font-bold text-slate-200">Tier 2: Google Gemini</span>
-                </div>
-                <div className="text-[11px] text-cyan-400 font-bold mb-1">
-                  gemini-3.8-flash
-                </div>
-                <p className="text-[10px] text-slate-400 mb-2">
-                  Seamlessly auto-engages if NVIDIA API key is absent, rate-limited, or network fails.
-                </p>
-                <div className="flex items-center justify-between text-[10px] pt-2 border-t border-slate-800/80">
-                  <span className="text-slate-500">Latency: ~100-150ms</span>
-                  <span className="text-cyan-400 font-semibold">
-                    {routerHealth?.tier2?.status || "Standby Failover"}
-                  </span>
-                </div>
-              </div>
-
-              {/* Tier 3 Card */}
-              <div className="p-3 rounded-lg bg-slate-900/90 border border-amber-800/60 relative overflow-hidden">
-                <div className="absolute top-0 right-0 px-2 py-0.5 rounded-bl bg-amber-950 text-amber-400 text-[9px] font-bold border-l border-b border-amber-800">
-                  RESERVE TIER
-                </div>
-                <div className="flex items-center gap-2 mb-2">
-                  <Zap className="h-4 w-4 text-amber-400" />
-                  <span className="font-bold text-slate-200">Tier 3: Built-in AI</span>
-                </div>
-                <div className="text-[11px] text-amber-400 font-bold mb-1">
-                  Neuro-Symbolic v2.4
-                </div>
-                <p className="text-[10px] text-slate-400 mb-2">
-                  100% offline deterministic tactical solver. Guarantees 0 tick lag if internet disconnects.
-                </p>
-                <div className="flex items-center justify-between text-[10px] pt-2 border-t border-slate-800/80">
-                  <span className="text-slate-500">Latency: &lt;1ms (0ms)</span>
-                  <span className="text-amber-400 font-semibold">100% Guaranteed</span>
-                </div>
-              </div>
+              ))}
             </div>
           </div>
         )}
 
-        {/* Feature Deck 1: NVIDIA NVAPI & Hardware Telemetry Station (When NVIDIA is Selected) */}
+        {/* Feature Deck 1: NVIDIA NIM Cloud Station (When NVIDIA is Selected) */}
         {provider === "nvidia" && (
           <div className="mt-4 p-4 rounded-xl bg-slate-950/80 border border-emerald-800/40 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
@@ -695,14 +654,14 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="text-xs sm:text-sm font-bold font-mono text-emerald-400">
-                      NVIDIA NVAPI & TensorRT Hardware Station
+                      NVIDIA NIM Cloud Inference Station
                     </h3>
                     <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-700/50">
-                      NVAPI 64-bit v13.4
+                      OpenAI-compatible API
                     </span>
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    Direct JNI connection to <code className="text-slate-300">nvapi64.dll</code> and NVIDIA NIM Inference Microservices
+                    Inference via <code className="text-slate-300">{routerHealth?.tier1?.name ? "NVIDIA NIM endpoints" : "NVIDIA NIM"}</code> — configured with <code className="text-slate-300">NVIDIA_API_KEY</code> / <code className="text-slate-300">NVIDIA_BASE_URL</code> in config.env
                   </p>
                 </div>
               </div>
@@ -717,7 +676,7 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 {isTestingNvidia ? (
                   <>
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    <span>Benchmarking...</span>
+                    <span>Testing...</span>
                   </>
                 ) : (
                   <>
@@ -745,43 +704,26 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
               </div>
             )}
 
-            {/* GPU Telemetry Grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+            {/* Endpoint status strip (live from router-status; no fake GPU telemetry) */}
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs font-mono">
               <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                <span className="text-[10px] text-slate-500 block">GPU Device</span>
-                <span className="font-bold text-slate-200 truncate block">{nvapiData.gpuName.split("(")[0]}</span>
-                <span className="text-[10px] text-emerald-400">Driver 560.81 WHQL</span>
+                <span className="text-[10px] text-slate-500 block">API KEY</span>
+                <span className={`font-bold block ${routerHealth?.tier1?.available ? "text-emerald-400" : "text-amber-400"}`}>
+                  {routerHealth?.tier1?.available ? "NVIDIA_API_KEY set" : "Not configured"}
+                </span>
+                <span className="text-[10px] text-slate-400">{routerHealth?.tier1?.status || "Checking..."}</span>
               </div>
-
               <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                <div className="flex justify-between items-center text-[10px] text-slate-500 mb-1">
-                  <span>VRAM Allocated</span>
-                  <span className="text-emerald-400 font-bold">{(nvapiData.vramUsedMb / 1024).toFixed(1)} / {(nvapiData.vramTotalMb / 1024).toFixed(1)} GB</span>
-                </div>
-                <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                  <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${(nvapiData.vramUsedMb / nvapiData.vramTotalMb) * 100}%` }} />
-                </div>
-                <span className="text-[10px] text-slate-400 mt-1 block">GDDR6X ECC Active</span>
+                <span className="text-[10px] text-slate-500 block">BASE URL</span>
+                <span className="font-bold text-slate-200 truncate block" title={routerHealth?.defaultUrl}>
+                  {routerHealth?.defaultUrl || "https://integrate.api.nvidia.com/v1"}
+                </span>
+                <span className="text-[10px] text-slate-400">Override: NVIDIA_BASE_URL</span>
               </div>
-
               <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                <div className="flex justify-between items-center text-[10px] text-slate-500 mb-1">
-                  <span>Tensor Cores Load</span>
-                  <span className="text-emerald-400 font-bold">{nvapiData.gpuUtilizationPct}%</span>
-                </div>
-                <div className="w-full h-1.5 rounded-full bg-slate-800 overflow-hidden">
-                  <div className="h-full bg-cyan-500 rounded-full" style={{ width: `${nvapiData.gpuUtilizationPct}%` }} />
-                </div>
-                <span className="text-[10px] text-slate-400 mt-1 block">TensorRT-LLM FP16</span>
-              </div>
-
-              <div className="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
-                <span className="text-[10px] text-slate-500 block">DLSS 3.5 & Reflex</span>
-                <div className="flex items-center gap-1.5 mt-0.5">
-                  <span className="text-emerald-400 font-bold">Frame Gen: ON</span>
-                  <span className="text-[10px] text-slate-400">({nvapiData.reflexLatencyMs}ms)</span>
-                </div>
-                <span className="text-[10px] text-slate-400">Zero input stutter</span>
+                <span className="text-[10px] text-slate-500 block">ACTIVE MODEL</span>
+                <span className="font-bold text-emerald-300 break-all block">{nvidiaModel}</span>
+                <span className="text-[10px] text-slate-400">Default: NVIDIA_MODEL in config.env</span>
               </div>
             </div>
 
@@ -791,10 +733,9 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 <span className="text-xs font-mono text-slate-400">NVIDIA NIM Model:</span>
                 <div className="flex flex-wrap gap-1.5">
                   {[
-                    { id: "meta/llama-3.2-11b-vision-instruct", label: "Llama 3.2 11B Vision (Primary • High Speed)" },
-                    { id: "meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Ultra-Fast)" },
+                    { id: "meta/llama-3.2-11b-vision-instruct", label: "Llama 3.2 11B Vision (Default)" },
+                    { id: "meta/llama-3.1-8b-instruct", label: "Llama 3.1 8B (Fast)" },
                     { id: "meta/llama-3.3-70b-instruct", label: "Llama 3.3 70B (High Precision)" },
-                    { id: "qwen/qwen2.5-coder-32b-instruct", label: "Qwen 2.5 Coder 32B" },
                     { id: "nvidia/llama-3.1-nemotron-70b-instruct", label: "Nemotron 70B" },
                   ].map(({ id, label }) => (
                     <button
@@ -812,9 +753,14 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                   ))}
                 </div>
               </div>
-              <span className="text-[10px] font-mono text-emerald-400">
-                Unlimited High-Throughput TensorRT
-              </span>
+              <input
+                type="text"
+                value={nvidiaModel}
+                onChange={(e) => onSelectNvidiaModel && onSelectNvidiaModel(e.target.value)}
+                placeholder="custom/model-id"
+                title="Type any model ID available on your NVIDIA NIM endpoint"
+                className="w-44 bg-slate-900 border border-slate-800 rounded px-2 py-1 text-[11px] font-mono text-slate-200 focus:border-emerald-500 focus:outline-none"
+              />
             </div>
           </div>
         )}
@@ -992,12 +938,12 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
             <div className="flex flex-wrap gap-1.5 pt-2 border-t border-slate-800">
               <span className="text-[10px] font-mono text-slate-500 self-center mr-1">Recommended Presets:</span>
               {[
-                "qwen2.5-coder:7b",
-                "qwen2.5-coder:14b",
-                "qwen2.5-coder:32b",
-                "qwen2.5:7b",
-                "llama3.1:8b",
-                "mistral:latest"
+                "qwen2.5vl:3b",
+                "qwen2.5vl:7b",
+                "llama3.2-vision:11b",
+                "llama3.2:3b",
+                "qwen2.5:3b",
+                "minicpm-v:8b"
               ].map((m) => (
                 <button
                   key={m}
@@ -1032,7 +978,7 @@ export const AiBrainConsole: React.FC<AiBrainConsoleProps> = ({
                 </button>
               </div>
               <p className="text-[10px] text-slate-400">
-                Pairs <strong>Qwen 2.5 Coder</strong> (tactical JSON code generation) with a dedicated vision model (<strong>Moondream:1.8b</strong> in Ollama or <strong>Gemini 3.8 Flash</strong>) to caption and inspect first-person Minecraft terrain, hazards, and mobs.
+                Pairs your selected Ollama model with a dedicated vision model (<strong>qwen2.5vl</strong> / <strong>moondream</strong> in Ollama, or the Gemini vision model from config.env) to caption and inspect first-person Minecraft terrain, hazards, and mobs.
               </p>
               {visionPerceptionResult && (
                 <div className="p-2 rounded bg-black/40 border border-teal-900/60 text-[11px] text-teal-200">
