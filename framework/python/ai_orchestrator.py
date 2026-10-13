@@ -104,6 +104,8 @@ class ModelAdapter:
 
     def __init__(self, provider: str = "ollama", model_name: Optional[str] = None, api_key: Optional[str] = None):
         self.provider = provider.lower().strip()
+        self._explicit_model_name = model_name
+        self._explicit_api_key = api_key
         self.api_key = api_key or os.environ.get(f"{self.provider.upper()}_API_KEY")
         self.base_url = (
             os.environ.get(f"{self.provider.upper()}_BASE_URL")
@@ -126,19 +128,69 @@ class ModelAdapter:
         elif self.provider == "anthropic":
             self.model_name = self.model_name or os.environ.get("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 
+    def _provider_is_configured(self, provider: str) -> bool:
+        """Return whether a provider has enough local config to attempt a request."""
+        if provider == "ollama":
+            return bool(os.environ.get("OLLAMA_MODEL") or "llama3:latest")
+        if provider == "gemini":
+            return bool(os.environ.get("GEMINI_API_KEY") and (os.environ.get("GEMINI_MODEL") or "gemini-2.5-flash"))
+        if provider == "openai":
+            return bool(os.environ.get("OPENAI_API_KEY") and (os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"))
+        if provider == "anthropic":
+            return bool(os.environ.get("ANTHROPIC_API_KEY") and (os.environ.get("ANTHROPIC_MODEL") or "claude-3-5-sonnet-20241022"))
+        if provider in self.OPENAI_COMPATIBLE_DEFAULTS:
+            _, key_env, model_env = self.OPENAI_COMPATIBLE_DEFAULTS[provider]
+            has_key = bool(os.environ.get(key_env)) or provider == "custom_openai"
+            has_model = bool(os.environ.get(model_env))
+            return has_key and has_model
+        return False
+
+    async def _generate_with_selected_provider(self, provider: str, telemetry: Dict[str, Any], goal: str, memory_summary: str, litematica_diff: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        adapter = self if provider == self.provider else ModelAdapter(provider=provider)
+        user_prompt = adapter._build_prompt(telemetry, goal, memory_summary, litematica_diff)
+        if provider == "ollama":
+            return await adapter._call_ollama(user_prompt)
+        if provider == "gemini":
+            return await adapter._call_gemini(user_prompt)
+        if provider == "openai":
+            return await adapter._call_openai(user_prompt)
+        if provider == "anthropic":
+            return await adapter._call_anthropic(user_prompt)
+        if provider in self.OPENAI_COMPATIBLE_DEFAULTS or adapter.base_url:
+            return await adapter._call_openai_compatible(user_prompt)
+        raise ValueError(f"Unsupported provider: {provider}")
+
     async def generate_action_plan(self, telemetry: Dict[str, Any], goal: str, memory_summary: str, litematica_diff: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        user_prompt = self._build_prompt(telemetry, goal, memory_summary, litematica_diff)
-        if self.provider == "ollama":
-            return await self._call_ollama(user_prompt)
-        if self.provider == "gemini":
-            return await self._call_gemini(user_prompt)
-        if self.provider == "openai":
-            return await self._call_openai(user_prompt)
-        if self.provider == "anthropic":
-            return await self._call_anthropic(user_prompt)
-        if self.provider in self.OPENAI_COMPATIBLE_DEFAULTS or self.base_url:
-            return await self._call_openai_compatible(user_prompt)
-        raise ValueError(f"Unsupported provider: {self.provider}. Supported: {', '.join(sorted(set(self.OPENAI_COMPATIBLE_DEFAULTS) | {'ollama', 'gemini', 'openai', 'anthropic'}))}")
+        if self.provider == "auto":
+            priority = [
+                item.strip().lower()
+                for item in os.environ.get("AI_PROVIDER_PRIORITY", "gemini,openrouter,groq,nvidia,ollama").split(",")
+                if item.strip()
+            ]
+            supported = set(self.OPENAI_COMPATIBLE_DEFAULTS) | {"ollama", "gemini", "openai", "anthropic"}
+            unknown = [item for item in priority if item not in supported]
+            if unknown:
+                print(f"[ModelAdapter] Ignoring unsupported providers in AI_PROVIDER_PRIORITY: {', '.join(unknown)}")
+            seen = set()
+            ordered = [item for item in priority if item in supported and not (item in seen or seen.add(item))]
+            failures = []
+            for provider in ordered:
+                if not self._provider_is_configured(provider):
+                    print(f"[ModelAdapter] Skipping {provider}: missing required API key or model setting.")
+                    continue
+                try:
+                    print(f"[ModelAdapter] Trying provider: {provider}")
+                    result = await self._generate_with_selected_provider(provider, telemetry, goal, memory_summary, litematica_diff)
+                    print(f"[ModelAdapter] Provider succeeded: {provider}")
+                    return result
+                except Exception as exc:
+                    failures.append(f"{provider}: {type(exc).__name__}: {str(exc)[:240]}")
+                    print(f"[ModelAdapter] Provider {provider} failed; trying next priority.")
+            if not failures:
+                raise RuntimeError("AI_PROVIDER=auto found no configured providers. Add API keys/model IDs and set AI_PROVIDER_PRIORITY.")
+            raise RuntimeError("All configured AI providers failed: " + " | ".join(failures))
+
+        return await self._generate_with_selected_provider(self.provider, telemetry, goal, memory_summary, litematica_diff)
 
     def _build_prompt(self, telemetry: Dict[str, Any], goal: str, memory_summary: str, diff: Optional[Dict[str, Any]]) -> str:
         player = telemetry.get("player", {})
@@ -477,7 +529,7 @@ class MinecraftAiOrchestrator:
 # CLI Entry Point
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Minecraft-AI-Bridge Python AI Orchestrator")
-    supported_providers = sorted(set(ModelAdapter.OPENAI_COMPATIBLE_DEFAULTS) | {"ollama", "gemini", "openai", "anthropic"})
+    supported_providers = sorted(set(ModelAdapter.OPENAI_COMPATIBLE_DEFAULTS) | {"ollama", "gemini", "openai", "anthropic", "auto"})
     parser.add_argument(
         "--provider", choices=supported_providers,
         default=os.environ.get("AI_PROVIDER", "ollama").strip().lower(),
