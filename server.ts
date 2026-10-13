@@ -5,7 +5,6 @@ import fs from "fs";
 import os from "os";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 import JSZip from "jszip";
@@ -1252,6 +1251,20 @@ app.get("/api/bridge/status", async (req, res) => {
   }
 
   return res.json({ connected: false, message: "Minecraft bridge IPC is not yet reachable on ports 8080 or 8079." });
+});
+
+// WebSocket upgrade proxy: browser dashboard -> dashboard server -> Fabric client IPC.
+// The browser cannot open ws://localhost:<botPort> directly when the dashboard is
+// served from a container-mapped port, so /api/bridge/:port/ws is tunneled here.
+import httpProxyPkg from "http-proxy";
+const httpProxy = (httpProxyPkg as any).default ?? httpProxyPkg;
+const wsProxy = httpProxy.createProxyServer({ ws: true });
+wsProxy.on("error", (err: any) => { /* client/bot disconnected - ignore */ });
+app.get("/api/bridge/:port/ws", (req, res) => {
+  const port = req.params.port;
+  wsProxy.ws(req, res, { target: `http://127.0.0.1:${port}`, changeOrigin: true }, (err) => {
+    res.status(502).end(`WebSocket bridge unavailable on port ${port}`);
+  });
 });
 
 // Proxy REST API and actions to Minecraft Bridge
@@ -2788,30 +2801,32 @@ app.post("/api/ai/vision-describe", async (req, res) => {
 
 // Start server logic
 function startServer() {
-  // The production bundle (dist/server.cjs, built by `npm run build`) is always
-  // served from dist/. Previously this branch only triggered when NODE_ENV was
-  // exactly "production" - but any NODE_ENV injected via config.env / compose
-  // (e.g. "development") made the bundled server fall back to Vite dev-mode
-  // middleware, which fails inside the container and left the dashboard blank.
-  const isBundled = __filename.endsWith(".cjs") || __filename.endsWith(".js");
+  // ALWAYS serve the built static bundle from dist/. The previous code had a
+  // Vite dev-middleware fallback for non-production NODE_ENV, but inside the
+  // Docker container the server runs as the esbuild bundle (dist/server.cjs),
+  // where "vite" is external and dev middleware silently fails -> blank page
+  // stuck at loading. If dist/index.html is missing, run a one-time build.
   const distPath = path.join(process.cwd(), "dist");
-  const useStatic =
-    process.env.NODE_ENV === "production" ||
-    (isBundled && fs.existsSync(path.join(distPath, "index.html")));
 
-  if (!useStatic) {
-    createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    }).then((vite) => {
-      app.use(vite.middlewares);
-    });
-  } else {
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+  if (!fs.existsSync(path.join(distPath, "index.html"))) {
+    console.log("[Minecraft-AI-Bridge] dist/index.html missing - building dashboard once...");
+    try {
+      execSync("npm run build", { stdio: "inherit", cwd: process.cwd() });
+    } catch (e) {
+      console.error("[Minecraft-AI-Bridge] Dashboard build failed:", (e as Error).message);
+    }
   }
+
+  app.use(express.static(distPath));
+  // SPA fallback for any non-API GET request. Express 5 requires named wildcards.
+  app.get("*", (req, res) => {
+    const indexFile = path.join(distPath, "index.html");
+    if (fs.existsSync(indexFile)) {
+      res.sendFile(indexFile);
+    } else {
+      res.status(503).send("Dashboard not built yet.");
+    }
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Minecraft-AI-Bridge] Web Studio listening on http://0.0.0.0:${PORT}`);

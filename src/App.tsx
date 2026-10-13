@@ -404,7 +404,9 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(action)
       }).catch(() => {
-        fetch(`http://localhost:${targetPort}/api/action`, {
+        // Last-resort fallback also goes through the same-origin dashboard proxy
+        // (direct browser->bot fetch is blocked by CORS in the Docker setup).
+        fetch(`/api/bridge/${targetPort}/action`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(action)
@@ -453,7 +455,8 @@ export default function App() {
     const connect = (port: number, index: number) => {
       try {
         console.log(`[IPC] Attempting connection to port ${port}...`);
-        const ws = new WebSocket(`ws://localhost:${port}/ws`);
+        const wsProto = window.location.protocol === "https:" ? "wss:" : "ws:";
+        const ws = new WebSocket(`${wsProto}//${window.location.host}/api/bridge/${port}/ws`);
         socketsMap.set(port, ws);
         socketsRef.current = socketsMap;
 
