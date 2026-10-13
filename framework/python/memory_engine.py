@@ -5,6 +5,7 @@ Provides Short-Term Rolling Action Buffer and Long-Term Spatial Landmark / Goal 
 
 import json
 import os
+import tempfile
 import time
 from collections import deque
 from typing import Dict, List, Optional, Any
@@ -91,8 +92,26 @@ class MemoryEngine:
                 print(f"[MemoryEngine] Error loading memory from {self.storage_path}: {e}")
 
     def persist(self):
+        """Atomically replace the JSON file so interruption cannot truncate memory."""
+        directory = os.path.dirname(os.path.abspath(self.storage_path))
+        temporary_path = None
         try:
-            with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump(self.long_term_data, f, indent=2)
+            os.makedirs(directory, exist_ok=True)
+            fd, temporary_path = tempfile.mkstemp(
+                prefix=".ai-memory-", suffix=".tmp", dir=directory
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.long_term_data, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, self.storage_path)
+            temporary_path = None
         except Exception as e:
             print(f"[MemoryEngine] Error persisting memory to {self.storage_path}: {e}")
+            raise
+        finally:
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.remove(temporary_path)
+                except OSError:
+                    pass
