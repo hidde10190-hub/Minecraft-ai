@@ -276,6 +276,60 @@ app.post("/api/nvidia/test", async (req, res) => {
   }
 });
 
+// Minecraft Server List Ping endpoint (used by the Standalone Client Launcher tab).
+// This route was missing from the rewritten server.ts: the browser fetch() hit the
+// SPA catch-all fallback, which returned index.html; res.json() then threw and the
+// launcher panel hung forever on "loading".
+app.get("/api/minecraft/ping", async (req, res) => {
+  const host = String(req.query.host || process.env.MINECRAFT_SERVER_HOST || "host.docker.internal");
+  const port = parseInt(String(req.query.port || process.env.MINECRAFT_SERVER_PORT || "25565"), 10);
+  try {
+    const result = await pingMinecraftServer(host, port, 4000);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ online: false, host, port, error: err.message });
+  }
+});
+
+// Full project export as ZIP (used by the Header "Export" button). Also previously
+// missing -> 404 fell through to the SPA fallback HTML, breaking the download flow.
+app.get("/api/export-full-zip", async (req, res) => {
+  try {
+    const zip = new JSZip();
+    const rootDir = process.cwd();
+    const skipDirs = new Set(["node_modules", ".git", "dist", "__pycache__", ".gradle", "build"]);
+
+    const addDir = async (dirAbs: string, dirRel: string) => {
+      const entries = await fs.promises.readdir(dirAbs, { withFileTypes: true });
+      for (const entry of entries) {
+        if (skipDirs.has(entry.name)) continue;
+        const abs = path.join(dirAbs, entry.name);
+        const rel = dirRel ? `${dirRel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await addDir(abs, rel);
+        } else if (entry.isFile()) {
+          const content = await fs.promises.readFile(abs);
+          zip.file(rel, content);
+        }
+      }
+    };
+
+    await addDir(rootDir, "");
+    // Always include the built dashboard bundle so an exported project boots instantly
+    const distIndex = path.join(rootDir, "dist", "index.html");
+    if (fs.existsSync(distIndex)) {
+      zip.file("dist/index.html", await fs.promises.readFile(distIndex));
+    }
+
+    const buf = await zip.generateAsync({ type: "nodebuffer" });
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="minecraft-ai-controller-framework.zip"');
+    res.send(buf);
+  } catch (err: any) {
+    res.status(500).json({ error: `ZIP export failed: ${err.message}` });
+  }
+});
+
 // Test Ollama Endpoint Diagnostics & Auto-Discovery
 app.post("/api/ollama/test", async (req, res) => {
   const startTime = Date.now();
@@ -1115,37 +1169,65 @@ app.post("/api/nvidia/test", async (req, res) => {
 
 // Dynamic Minecraft Bridge Discovery and Proxy
 const workingBridgeHosts = new Map<string, string>();
+// When the bridge is offline, every proxy call used to re-probe ALL candidate
+// hosts serially (6 x 1.2s timeouts = ~7s per request). The dashboard polls
+// /api/bridge/status + state every 1.5s, which saturated the event loop and
+// made the UI hang forever on "loading". Cache negative results briefly so an
+// offline bridge costs at most one short probe per window.
+const bridgeFailCache = new Map<string, number>();
+const BRIDGE_FAIL_CACHE_MS = 3000;
+// Single in-flight probe per port (dedupe concurrent pollers hammering the same dead port)
+const bridgeProbeInFlight = new Map<string, Promise<string>>();
 
 async function getWorkingBridgeBase(port: string): Promise<string> {
-  if (workingBridgeHosts.has(port)) {
-    return workingBridgeHosts.get(port)!;
+  const cached = workingBridgeHosts.get(port);
+  if (cached) {
+    // Validate the remembered base occasionally? Keep it simple: trust success cache;
+    // if it goes stale the proxy calls fail fast (ECONNREFUSED) and we drop below.
+    return cached;
   }
-  const candidates = [
-    process.env.BRIDGE_HOST,
-    "minecraft-fabric-standalone",
-    "minecraft-standalone-client",
-    "127.0.0.1",
-    "localhost",
-    "host.docker.internal"
-  ].filter(Boolean) as string[];
 
-  for (const host of candidates) {
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1200);
-      const res = await fetch(`http://${host}:${port}/api/status`, { signal: controller.signal });
-      clearTimeout(timeoutId);
-      if (res.ok) {
-        const base = `http://${host}:${port}`;
-        workingBridgeHosts.set(port, base);
-        return base;
+  const failUntil = bridgeFailCache.get(port) || 0;
+  if (Date.now() < failUntil) {
+    return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+  }
+
+  const existing = bridgeProbeInFlight.get(port);
+  if (existing) return existing;
+
+  const probe = (async (): Promise<string> => {
+    const candidates = [
+      process.env.BRIDGE_HOST,
+      "minecraft-fabric-standalone",
+      "minecraft-standalone-client",
+      "127.0.0.1",
+      "localhost",
+      "host.docker.internal"
+    ].filter(Boolean) as string[];
+
+    for (const host of candidates) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 1200);
+        const res = await fetch(`http://${host}:${port}/api/status`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          const base = `http://${host}:${port}`;
+          workingBridgeHosts.set(port, base);
+          bridgeFailCache.delete(port);
+          return base;
+        }
+      } catch {
+        // try next candidate
       }
-    } catch {
-      // try next candidate
     }
-  }
 
-  return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+    bridgeFailCache.set(port, Date.now() + BRIDGE_FAIL_CACHE_MS);
+    return `http://${process.env.BRIDGE_HOST || "127.0.0.1"}:${port}`;
+  })().finally(() => bridgeProbeInFlight.delete(port));
+
+  bridgeProbeInFlight.set(port, probe);
+  return probe;
 }
 
 // Check bridge health across ports 8080 and 8079
