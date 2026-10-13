@@ -2674,15 +2674,26 @@ app.post("/api/ai/vision-describe", async (req, res) => {
 });
 
 // Start server logic
-async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
-    const vite = await createViteServer({
+function startServer() {
+  // The production bundle (dist/server.cjs, built by `npm run build`) is always
+  // served from dist/. Previously this branch only triggered when NODE_ENV was
+  // exactly "production" - but any NODE_ENV injected via config.env / compose
+  // (e.g. "development") made the bundled server fall back to Vite dev-mode
+  // middleware, which fails inside the container and left the dashboard blank.
+  const isBundled = __filename.endsWith(".cjs") || __filename.endsWith(".js");
+  const distPath = path.join(process.cwd(), "dist");
+  const useStatic =
+    process.env.NODE_ENV === "production" ||
+    (isBundled && fs.existsSync(path.join(distPath, "index.html")));
+
+  if (!useStatic) {
+    createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
+    }).then((vite) => {
+      app.use(vite.middlewares);
     });
-    app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
