@@ -520,6 +520,33 @@ public class GameStateExporter {
         return json;
     }
 
+    /**
+     * Compact voxel encoding shared by all cube-map producers: voxels are emitted as
+     * [dx, dy, dz, typeId, flags] tuples against a per-scan palette instead of verbose
+     * per-object JSON with absolute coordinates and full namespace prefixes. This keeps
+     * live scans (~5k blocks at r=8) small enough to travel through the dashboard proxy
+     * without tripping body-size limits. Consumers (server.ts / cubeMapEngine.ts) decode
+     * this format transparently.
+     */
+    private static void addCompactVoxel(JsonArray voxels, java.util.Map<String, Integer> paletteIndex, List<String> palette,
+                                        String fullName, int x, int y, int z, int cx, int cy, int cz,
+                                        boolean solid, boolean isHazard, boolean isOre) {
+        Integer id = paletteIndex.get(fullName);
+        if (id == null) {
+            id = palette.size();
+            paletteIndex.put(fullName, id);
+            palette.add(fullName);
+        }
+        int flags = (solid ? 1 : 0) | (isHazard ? 2 : 0) | (isOre ? 4 : 0);
+        JsonArray v = new JsonArray();
+        v.add(x - cx);
+        v.add(y - cy);
+        v.add(z - cz);
+        v.add(id);
+        v.add(flags);
+        voxels.add(v);
+    }
+
     /** Builds the cube-map JSON from a flat array of block registry names captured on the render thread. */
     private String buildCubeMapJson(String[] names, int cx, int cy, int cz, int r) {
         int side = r * 2 + 1;
@@ -527,6 +554,8 @@ public class GameStateExporter {
         JsonArray ores = new JsonArray();
         JsonArray hazards = new JsonArray();
         JsonObject blockCounts = new JsonObject();
+        java.util.List<String> palette = new java.util.ArrayList<>();
+        java.util.Map<String, Integer> paletteIndex = new java.util.HashMap<>();
         int solidCount = 0;
         int airCount = 0;
 
@@ -553,15 +582,7 @@ public class GameStateExporter {
                     double dist = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
 
                     if (!isAir) {
-                        JsonObject v = new JsonObject();
-                        v.addProperty("x", x);
-                        v.addProperty("y", y);
-                        v.addProperty("z", z);
-                        v.addProperty("name", fullName);
-                        v.addProperty("solid", solid);
-                        v.addProperty("isHazard", isHazard);
-                        v.addProperty("isOre", isOre);
-                        voxels.add(v);
+                        addCompactVoxel(voxels, paletteIndex, palette, fullName, x, y, z, cx, cy, cz, solid, isHazard, isOre);
                     }
                     if (isOre) {
                         JsonObject o = new JsonObject();
@@ -607,6 +628,9 @@ public class GameStateExporter {
         summary.addProperty("densityPct", voxels.size() > 0 ? Math.round((solidCount / (float) (side * side * side)) * 100) : 0);
         root.add("summary", summary);
         root.add("voxels", voxels);
+        JsonArray paletteArr = new JsonArray();
+        for (String pname : palette) paletteArr.add(pname);
+        root.add("palette", paletteArr);
         return GSON.toJson(root);
     }
 
@@ -624,6 +648,8 @@ public class GameStateExporter {
         JsonArray ores = new JsonArray();
         JsonArray hazards = new JsonArray();
         JsonObject blockCounts = new JsonObject();
+        java.util.List<String> palette = new java.util.ArrayList<>();
+        java.util.Map<String, Integer> paletteIndex = new java.util.HashMap<>();
         int solidCount = 0;
         int airCount = 0;
 
@@ -650,15 +676,7 @@ public class GameStateExporter {
                     double dist = Math.sqrt((double) dx * dx + (double) dy * dy + (double) dz * dz);
 
                     if (!isAir) {
-                        JsonObject v = new JsonObject();
-                        v.addProperty("x", x);
-                        v.addProperty("y", y);
-                        v.addProperty("z", z);
-                        v.addProperty("name", fullName);
-                        v.addProperty("solid", solid);
-                        v.addProperty("isHazard", isHazard);
-                        v.addProperty("isOre", isOre);
-                        voxels.add(v);
+                        addCompactVoxel(voxels, paletteIndex, palette, fullName, x, y, z, bx, by, bz, solid, isHazard, isOre);
                     }
                     if (isOre) {
                         JsonObject o = new JsonObject();
@@ -704,6 +722,9 @@ public class GameStateExporter {
         summary.addProperty("densityPct", voxels.size() > 0 ? Math.round((solidCount / (float) (width * width * width)) * 100) : 0);
         root.add("summary", summary);
         root.add("voxels", voxels);
+        JsonArray paletteArr = new JsonArray();
+        for (String pname : palette) paletteArr.add(pname);
+        root.add("palette", paletteArr);
         return GSON.toJson(root);
     }
 

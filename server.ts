@@ -25,7 +25,10 @@ if (fs.existsSync(".env")) {
 const app = express();
 const PORT = parseInt(process.env.PORT || "3000", 10);
 
-app.use(express.json());
+// Raise the JSON body limit: plan payloads carry a full 3D voxel cube map (up to ~5k voxels),
+// which easily exceeds express.json()'s default 100kb and produced PayloadTooLargeError ->
+// the dashboard replied with an HTML error page, breaking res.json() on the client.
+app.use(express.json({ limit: "25mb" }));
 
 // Helper for VarInt encoding in Minecraft protocol
 function writeVarInt(value: number): Buffer {
@@ -1236,6 +1239,29 @@ let lastGoodLiveCubeMap: any = null;
 let lastGoodLiveCubeAt = 0;
 
 // 3D Block Cube Map Query Endpoint (Real Bridge Proxy + Procedural Solver)
+// Decode the Fabric bridge's compact voxel encoding ([dx, dy, dz, typeId, flags] tuples with a
+// root.palette of block names) back into { x, y, z, name, solid, isHazard, isOre } objects.
+// Verbose object-shaped voxels pass through untouched for backward compatibility.
+function decodeCubeVoxels(cubeMap: any): void {
+  if (!cubeMap || !Array.isArray(cubeMap.voxels) || !Array.isArray(cubeMap.palette)) return;
+  const palette = cubeMap.palette;
+  const center = Array.isArray(cubeMap.center) ? cubeMap.center : [0, 64, 0];
+  const cx = Math.floor(Number(center[0]) || 0), cy = Math.floor(Number(center[1]) || 0), cz = Math.floor(Number(center[2]) || 0);
+  cubeMap.voxels = cubeMap.voxels.map((v: any) => {
+    if (!Array.isArray(v)) return v;
+    const id = v[3] | 0, flags = v[4] | 0;
+    return {
+      x: cx + v[0],
+      y: cy + v[1],
+      z: cz + v[2],
+      name: String(palette[id] ?? "minecraft:stone"),
+      solid: (flags & 1) !== 0,
+      isHazard: (flags & 2) !== 0,
+      isOre: (flags & 4) !== 0,
+    };
+  });
+}
+
 app.all(["/api/bot/cube-map", "/api/bridge/:port/cube-map"], async (req, res) => {
   const reqPort = req.params?.port || "8080";
   const cx = parseFloat((req.query.x || req.body?.x || 100) as string);
@@ -1261,6 +1287,7 @@ app.all(["/api/bot/cube-map", "/api/bridge/:port/cube-map"], async (req, res) =>
       if (!bridgeRes) break;
       const liveCube: any = await bridgeRes.json().catch(() => null);
       if (liveCube && String(liveCube.source || "").includes("live") && Array.isArray(liveCube.voxels)) {
+        decodeCubeVoxels(liveCube);
         return res.json({ source: "live_minecraft_bridge", ...liveCube });
       }
       if (bridgeRes.status === 202 || (liveCube && liveCube.scanning)) {
@@ -1464,6 +1491,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
         const status = bridgeRes.status;
         const liveData: any = await bridgeRes.json().catch(() => null);
         if (liveData && String(liveData.source || "").includes("live") && Array.isArray(liveData.voxels)) {
+          decodeCubeVoxels(liveData);
           cubeMap = { ...liveData, center: liveData.center || [sx, sy, sz], radius: scanRadius };
           liveCubeScanned = true;
           lastGoodLiveCubeMap = cubeMap;
