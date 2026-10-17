@@ -1347,7 +1347,11 @@ export default function App() {
     } else if (action.type === "select_hotbar") {
       if (action.slot !== undefined) {
         const targetSlot = Math.max(0, Math.min(8, action.slot));
-        setPlayer((p) => ({ ...p, selectedSlot: targetSlot }));
+        // OPTIMISTIC local state is only valid OFFLINE. When a live bridge is connected
+        // the REAL hotbar (and held item) comes from the game's telemetry packets -
+        // trusting stale/empty local state here made placements validate against items
+        // the bot does not actually hold (e.g. air/hand or an axe).
+        setPlayer((p) => (isConnected ? p : { ...p, selectedSlot: targetSlot }));
         setAgents((prev) =>
           prev.map((ag) =>
             ag.id === targetAgentId
@@ -1454,15 +1458,51 @@ export default function App() {
       // Actual Game Information: verify what is ACTUALLY held in the active hand
       const activeSlot = action.slot !== undefined ? Math.max(0, Math.min(8, Number(action.slot))) : (currentP.selectedSlot ?? 0);
       const heldStack = currentP.hotbar?.[activeSlot];
-      const actualHeldItem = (heldStack && heldStack.count > 0 && heldStack.item && heldStack.item !== "minecraft:air")
+      let actualHeldItem = (heldStack && heldStack.count > 0 && heldStack.item && heldStack.item !== "minecraft:air")
         ? heldStack.item
         : null;
+      // Ground truth from the live bridge beats local guesswork: main_hand / held item.
+      if (!actualHeldItem && isConnected) {
+        const mg = (currentP as any).mainHand || (currentP as any).main_hand || (currentP as any).heldItem;
+        const mgItem = typeof mg === "string" ? mg : mg?.item;
+        if (mgItem && String(mgItem).toLowerCase() !== "minecraft:air") actualHeldItem = String(mgItem);
+      }
 
       if (!actualHeldItem) {
         setThoughtLog((t) => [
           `[Placement Denied]: Slot ${activeSlot} is empty or air! Cannot place block at [${targetX}, ${targetY}, ${targetZ}].`,
           ...t.slice(0, 30),
         ]);
+        return;
+      }
+
+      // WRONG-MATERIAL GUARD: if this placement targets a schematic cell that expects a
+      // specific block, never place a different one (this was the "oak logs counted as
+      // stone bricks" family of bugs - a mismatched stack silently filled brick cells).
+      const expectedCell = (diffs || []).find(
+        (d: any) => d && Math.floor(Number(d.x)) === targetX && Math.floor(Number(d.y)) === targetY && Math.floor(Number(d.z)) === targetZ && d.expectedBlock
+      );
+      if (expectedCell && !isExactBlockMatch(actualHeldItem, expectedCell.expectedBlock) &&
+          !blockNamesCompatible(String(actualHeldItem).replace(/^minecraft:/, ""), String(expectedCell.expectedBlock).replace(/^minecraft:/, ""))) {
+        // Try to re-point at a hotbar slot that DOES hold the expected material.
+        const correctSlot = (currentP.hotbar || []).findIndex((s: any) =>
+          s && s.count > 0 && s.item && isExactBlockMatch(s.item, expectedCell.expectedBlock));
+        if (correctSlot >= 0) {
+          setPlayer((p) => ({ ...p, selectedSlot: correctSlot }));
+          sendActionToBridge({ type: "select_hotbar", slot: correctSlot, agentId: targetAgentId });
+          sendActionToBridge({
+            type: "place_block", x: targetX, y: targetY, z: targetZ,
+            hand: action.hand || "main", side: action.side || "up",
+            block: currentP.hotbar[correctSlot].item, slot: correctSlot, agentId: targetAgentId,
+          });
+          worldVoxelMapRef.current.set(`${targetX},${targetY},${targetZ}`, currentP.hotbar[correctSlot].item);
+          setDiffs((prev) => prev.map((d) => (d === expectedCell ? { ...d, type: "CORRECT", currentBlock: currentP.hotbar[correctSlot].item } : d)));
+        } else {
+          setThoughtLog((t) => [
+            `[Placement Blocked]: Holding ${actualHeldItem.replace(/^minecraft:/, "")} but [${targetX}, ${targetY}, ${targetZ}] requires ${String(expectedCell.expectedBlock).replace(/^minecraft:/, "")}. No matching stack in hotbar - refusing to place wrong block.`,
+            ...t.slice(0, 30),
+          ]);
+        }
         return;
       }
 
@@ -1846,7 +1886,18 @@ export default function App() {
       if (foundSlot !== -1) {
         slotToUse = foundSlot;
       } else {
-        // Restock hotbar with the EXACT expected schematic block (no cobblestone instead of stone)
+        // Restock hotbar ONLY in offline simulation. Against a live bridge we must NOT
+        // fabricate stacks locally - that desyncs the UI from the real inventory and the
+        // bot then "places" items it does not actually hold (hand/axe symptom). When the
+        // exact material is missing, ask the bridge to equip it and skip this placement.
+        if (isConnected) {
+          handleDispatchAction({ type: "equip_item", item: expected });
+          setThoughtLog((t) => [
+            `[Restock Needed]: '${String(expected).replace(/^minecraft:/, "")}' not in real hotbar for [${target.x}, ${target.y}, ${target.z}] - requested equip, skipping placement.`,
+            ...t.slice(0, 30),
+          ]);
+          return;
+        }
         const emptySlot = player.hotbar.findIndex((s) => !s.item || s.item === "minecraft:air" || s.count === 0);
         slotToUse = emptySlot !== -1 ? emptySlot : (player.selectedSlot < 7 ? player.selectedSlot : 0);
         setPlayer((p) => {
@@ -1905,18 +1956,23 @@ export default function App() {
     setMaterials(design.materials);
     setCurrentPreset("ai_custom_house");
 
-    // Equip active builder's hotbar with all varied schematic materials
-    const uniqueBlocks = Array.from(new Set(design.blocks.map((b) => b.block)));
-    setPlayer((p) => {
-      const newHb = [...p.hotbar];
-      for (let i = 0; i < Math.min(7, uniqueBlocks.length); i++) {
-        newHb[i] = { slot: i, item: uniqueBlocks[i], count: 64 };
-      }
-      // Guarantee temporary scaffolding in slot 7
-      newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
-      newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
-      return { ...p, hotbar: newHb };
-    });
+    // Equip active builder's hotbar with all varied schematic materials.
+    // OFFLINE SIMULATION ONLY: against a live bridge, fabricating 64x stacks locally
+    // makes every planner believe the bot holds materials it doesn't - it then selects
+    // those fake slots and places whatever is REALLY in slot 0 (hand/axe/wrong block).
+    if (!isConnected) {
+      const uniqueBlocks = Array.from(new Set(design.blocks.map((b) => b.block)));
+      setPlayer((p) => {
+        const newHb = [...p.hotbar];
+        for (let i = 0; i < Math.min(7, uniqueBlocks.length); i++) {
+          newHb[i] = { slot: i, item: uniqueBlocks[i], count: 64 };
+        }
+        // Guarantee temporary scaffolding in slot 7
+        newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
+        newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
+        return { ...p, hotbar: newHb };
+      });
+    }
 
     setThoughtLog((prev) => [
       `[AI House Architect]: Successfully designed "${design.name}" [${design.engineUsed}] (${design.dimensions.width}x${design.dimensions.length}x${design.dimensions.height}, ${design.blocks.length} blocks, ${design.materials.length} material types).`,
@@ -1941,17 +1997,25 @@ export default function App() {
       }))
     );
 
-    // Populate active agent's hotbar with active schematic materials
-    setPlayer((p) => {
-      const newHb = [...p.hotbar];
-      const needed = materials.filter((m) => m.item !== "minecraft:air").map((m) => m.item);
-      for (let i = 0; i < Math.min(7, needed.length); i++) {
-        newHb[i] = { slot: i, item: needed[i], count: 64 };
-      }
-      newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
-      newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
-      return { ...p, hotbar: newHb };
-    });
+    // Populate active agent's hotbar with active schematic materials (offline sim only -
+    // never fabricate stacks against a live bridge; real inventory is ground truth).
+    if (!isConnected) {
+      setPlayer((p) => {
+        const newHb = [...p.hotbar];
+        const needed = materials.filter((m) => m.item !== "minecraft:air").map((m) => m.item);
+        for (let i = 0; i < Math.min(7, needed.length); i++) {
+          newHb[i] = { slot: i, item: needed[i], count: 64 };
+        }
+        newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
+        newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
+        return { ...p, hotbar: newHb };
+      });
+    } else {
+      setThoughtLog((prev) => [
+        `[Auto Material Gatherer]: Live bridge connected - reading REAL inventory instead of simulated restock. Missing materials will be reported, not fabricated.`,
+        ...prev,
+      ]);
+    }
 
     setThoughtLog((prev) => [
       `[Auto Material Gatherer]: Successfully gathered and restocked all missing building materials & scaffolding into player hotbar!`,

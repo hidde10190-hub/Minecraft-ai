@@ -53,6 +53,16 @@ export function blockNamesCompatible(aRaw: string, bRaw: string): boolean {
   const other = shorterFirst ? bt : bAsSet;
   if (base.every((t) => other.has(t)) && extras.length > 0 &&
       extras.every((t) => GENERIC_BLOCK_TOKENS.has(t) || FAMILY_BLOCK_TOKENS.has(t))) {
+    // STRICT VARIANT GUARD: the longer name must be ONE coherent variant of the
+    // shorter base - all its non-generic tokens belong to the same material word.
+    // Stops 'stone' (vanilla stone) from matching 'stone_bricks': 'brick' is a
+    // DIFFERENT material, not a modifier like 'mossy'/'smooth'.
+    const specific = shorterFirst ? extraB : extraA;
+    const materialToks = specific.filter((t) => !GENERIC_BLOCK_TOKENS.has(t));
+    const baseJoined = base.join("_");
+    const okVariant = materialToks.every((t) => baseJoined.includes(t) || t.includes(baseJoined) ||
+      [...base].some((bTok) => bTok.length >= 4 && (t.includes(bTok) || bTok.includes(t))));
+    if (!okVariant) return false;
     return true;
   }
   return false;

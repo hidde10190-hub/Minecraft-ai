@@ -1985,6 +1985,16 @@ function blockNamesCompatible(aRaw: string, bRaw: string): boolean {
   const other = shorterFirst ? new Set(bt) : bAsSet;
   if (base.every((t) => other.has(t)) && extras.length > 0 &&
       extras.every((t) => GENERIC_BLOCK_TOKENS.has(t) || FAMILY_BLOCK_TOKENS.has(t))) {
+    // STRICT VARIANT GUARD: the longer name must be ONE coherent variant of the
+    // shorter base - all its non-generic tokens belong to the same material word.
+    // This is what stops 'stone' (vanilla stone) from matching 'stone_bricks':
+    // 'brick' is a DIFFERENT material, not a modifier like 'mossy'/'smooth'.
+    const specific = shorterFirst ? extraB : extraA;
+    const materialToks = specific.filter((t) => !GENERIC_BLOCK_TOKENS.has(t));
+    const baseJoined = base.join("_");
+    const okVariant = materialToks.every((t) => baseJoined.includes(t) || t.includes(baseJoined) ||
+      [...base].some((bTok) => bTok.length >= 4 && (t.includes(bTok) || bTok.includes(t))));
+    if (!okVariant) return false;
     return true;
   }
   return false;
@@ -2032,7 +2042,10 @@ function getEffectiveHotbar(telemetry: any): any[] {
     return s.includes("helmet") || s.includes("chestplate") || s.includes("leggings") ||
       s.includes("boots") || s.includes("elytra") || s.includes("turtle_helmet");
   };
-  let hb: any[] = Array.isArray(player.hotbar) ? player.hotbar.filter((s: any) => s && String(s.item || "") !== "" ) : [];
+  // NOTE: do NOT filter empty stacks here - that would shift every stack down and
+  // make slot indices point at the WRONG item (root cause of "placing the axe/hand":
+  // a plan selects slot N but the filtered array's slot N holds a different item).
+  let hb: any[] = Array.isArray(player.hotbar) ? player.hotbar.map((s: any, i: number) => ({ slot: i, ...s })) : [];
   if (hb.length === 0 && Array.isArray(telemetry?.inventory)) {
     hb = Array.from({ length: 9 }).map((_, i) => {
       const found = telemetry.inventory.find((inv: any) =>
@@ -2599,6 +2612,16 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
       return found ? { slot: i, item: found.item || found.name, count: found.count || 1 } : { slot: i, item: "minecraft:air", count: 0 };
     });
   } else if (hotbarSlots.length > 0) {
+    // Re-index by each stack's own `slot` field FIRST: raw bridge arrays can be sparse
+    // or offset, and positional indexing would tell the LLM wrong slot numbers (which
+    // it then echoes in select_hotbar - placing hand/axe instead of the block).
+    const reindexed = Array.from({ length: 9 }).map((_, i) => ({ slot: i, item: "minecraft:air", count: 0 }));
+    hotbarSlots.forEach((s: any, idx: number) => {
+      const own = Number(s?.slot);
+      const pos = Number.isInteger(own) && own >= 0 && own <= 8 ? own : idx;
+      if (pos >= 0 && pos <= 8) reindexed[pos] = { ...s, slot: pos };
+    });
+    hotbarSlots = reindexed;
     // Sanitize any armor items that were miscategorized as hotbar slots 1-4
     hotbarSlots = hotbarSlots.map((s: any, idx: number) => {
       if (idx >= 1 && idx <= 4 && isArmorName(s?.item)) {
@@ -3738,20 +3761,40 @@ function postProcessPlanWithLearning(result: any, req: any): any {
     if (act.type === "place_block") {
       const slotIdx = pendingPlaceSlot ?? selectedSlot;
       const held = hotbar[slotIdx];
-      if (!isPlaceableBlockItem(held)) {
-        const matSlot = hotbar.findIndex((s: any) => isPlaceableBlockItem(s) && Number(s?.count || 0) > 0);
-        if (matSlot >= 0) {
-          if (pendingPlaceSlot !== null) { /* rewrite the preceding select_hotbar */ }
-          // Insert corrected selection just before this placement by mutating the
-          // preceding select_hotbar action when present, else emit a new one here.
-          const prevSel = result.actions.find((a: any, i: number) => i < result.actions.indexOf(act) && a.type === "select_hotbar");
-          if (prevSel) prevSel.slot = matSlot;
-          else act.select_slot_first = matSlot;
-          activeHeldItem = String(hotbar[matSlot].item).replace(/^minecraft:/, "");
-        } else {
+      // Expected material for THIS specific placement: the action itself, the nearest
+      // look_at/mine/goal hint. Placing ANY generic block instead of the expected one
+      // was how stone bricks ended up where oak logs belonged (and vice versa).
+      const expRaw = String(act.block || act.expectedBlock || currentTargetBlock || goalBlockHint || "").toLowerCase().replace(/^minecraft:/, "");
+      const normId = (x: any) => String(x?.item ?? x ?? "").toLowerCase().replace(/^minecraft:/, "");
+      const okStack = (s: any) => isPlaceableBlockItem(s) && Number(s?.count || 1) > 0 && normId(s) !== "air";
+      let chosenSlot = -1;
+      if (expRaw) {
+        // 1) exact ID match in the REAL hotbar, 2) token-family-compatible match.
+        chosenSlot = hotbar.findIndex((s: any) => okStack(s) && normId(s) === expRaw);
+        if (chosenSlot < 0) chosenSlot = hotbar.findIndex((s: any) => okStack(s) && blockNamesCompatible(normId(s), expRaw));
+        if (chosenSlot < 0) {
+          // Material not available: NEVER substitute an unrelated block - drop it.
+          act.__drop = true;
+          failureAlerts.push(`Dropped place_block at [${act.x},${act.y},${act.z}]: '${expRaw}' is not in the hotbar (refusing to place a wrong block).`);
+        }
+      } else if (!isPlaceableBlockItem(held) || Number(held?.count || 0) <= 0) {
+        chosenSlot = hotbar.findIndex((s: any) => okStack(s));
+        if (chosenSlot < 0) {
           act.__drop = true; // no placeable material at all - skip this placement
           failureAlerts.push(`Dropped place_block at [${act.x},${act.y},${act.z}]: hotbar has no block item (would have placed ${held?.item || "air"}).`);
         }
+      }
+      if (!act.__drop && chosenSlot >= 0) {
+        // Rewrite the most recent preceding select_hotbar (bridge executes sequentially)
+        // so the real game equips the correct slot BEFORE this placement runs.
+        const idx = result.actions.indexOf(act);
+        let prevSel: any = null;
+        for (let i = idx - 1; i >= 0; i--) {
+          if (result.actions[i]?.type === "select_hotbar") { prevSel = result.actions[i]; break; }
+        }
+        if (prevSel) prevSel.slot = chosenSlot;
+        else act.slot = chosenSlot;
+        activeHeldItem = normId(hotbar[chosenSlot]);
       }
     }
 
