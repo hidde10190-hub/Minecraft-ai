@@ -1,0 +1,125 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.17.20'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'Fabric'
+        url = 'https://maven.fabricmc.net/'
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content {
+            includeGroup "maven.modrinth"
+        }
+    }
+    maven {
+        name = 'Masa Maven'
+        url = 'https://masa.dy.fi/maven'
+    }
+    maven {
+        name = 'JitPack'
+        url = 'https://jitpack.io'
+    }
+    maven {
+        name = 'CurseMaven'
+        url = 'https://cursemaven.com'
+        content {
+            includeGroup "curse.maven"
+        }
+    }
+}
+
+configurations.configureEach {
+    exclude group: 'org.slf4j', module: 'slf4j-simple'
+}
+
+dependencies {
+    // Minecraft & Fabric Environment
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    // Mappings are not required for Minecraft 26.2+ as the jar is already unobfuscated.
+    // Removing loom.officialMojangMappings() to fix "Cannot use Mojang mappings in a non-obfuscated environment" error.
+
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+
+    // Fabric API
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // High-speed Embedded WebSocket & HTTP Server for AI IPC
+    implementation "io.javalin:javalin:6.1.3"
+    include "io.javalin:javalin:6.1.3"
+    implementation "com.google.code.gson:gson:2.10.1"
+    include "com.google.code.gson:gson:2.10.1"
+
+    // Performance Optimization Stack
+    implementation("maven.modrinth:AANobbMI:2Yom1N68") // Sodium 0.9.1 for 26.2
+    implementation("maven.modrinth:gvQqBUqZ:x1OEDMlF") // Lithium 0.25.0 for 26.2
+
+    // Simple Voice Chat API
+    implementation("maven.modrinth:9eGKb6K1:XOyGNG2m") // Simple Voice Chat 2.6.18 for 26.2
+    
+    // Litematica, MaLiLib & Syncmatica Integration
+    implementation("maven.modrinth:GcWjdA9I:KvjmGjAV") // MaLiLib 26.2-0.29.6
+    implementation("maven.modrinth:bEpr0Arc:CuniXtbo") // Litematica 0.28.8 for 26.2
+    implementation("maven.modrinth:bfneejKo:POv0nHxV") // Syncmatica 0.3.20 for 26.2
+}
+
+loom {
+    runs {
+        client {
+            client()
+            ideConfigGenerated(true)
+            name("Minecraft Client")
+            source(sourceSets.main)
+            String botUser = System.getProperty("minecraft.ai.botname", System.getenv("MINECRAFT_BOT_USERNAME") ?: System.getenv("BOT_NAME") ?: "Gemini")
+            programArgs "--username", botUser
+            vmArg "-Dfabric.gui.disable=true"
+            // Performance: runClient previously used Java's DEFAULT heap (often <256MB),
+            // causing constant GC thrashing and in-game lag. Give the game a real heap
+            // and a low-pause collector.
+            vmArg "-Xms2G"
+            vmArg "-Xmx4G"
+            vmArg "-XX:+UseG1GC"
+            vmArg "-XX:MaxGCPauseMillis=200"
+            vmArg "-XX:+PerfDisableSharedMem"
+        }
+    }
+}
+
+
+processResources {
+
+    inputs.property "version", project.version
+
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.encoding = "UTF-8"
+    it.options.release.set(25)
+}
+
+java {
+    withSourcesJar()
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.base.archivesName.get()}"}
+    }
+}

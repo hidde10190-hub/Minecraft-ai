@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "id": "minecraft-ai-bridge",
+  "version": "${version}",
+  "name": "Minecraft AI Bridge",
+  "description": "High-throughput autonomous AI Controller bridge with virtual input injection, telemetry serialization, and deep Litematica/Syncmatica integration.",
+  "authors": [
+    "Autonomous AI Architecture Team"
+  ],
+  "contact": {
+    "homepage": "https://github.com/minecraft-ai/minecraft-ai-bridge",
+    "sources": "https://github.com/minecraft-ai/minecraft-ai-bridge"
+  },
+  "license": "MIT",
+  "icon": "assets/minecraft-ai-bridge/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.minecraft.ai.MinecraftAiBridge"
+    ],
+    "voicechat": [
+      "com.minecraft.ai.voice.VoiceChatBridge"
+    ]
+  },
+  "mixins": [
+    "minecraft-ai-bridge.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.15.0",
+    "minecraft": ">=26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "malilib": ">=0.17.0",
+    "litematica": ">=0.16.0",
+    "syncmatica": "*"
+  }
+}

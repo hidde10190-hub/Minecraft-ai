@@ -1,0 +1,165 @@
+# ==============================================================================
+# Autonomous Standalone Fabric Client - Docker Compose Configuration
+# ==============================================================================
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+# ==============================================================================
+services:
+  minecraft-standalone-client:
+    image: eclipse-temurin:25-jdk-noble
+    container_name: minecraft-fabric-standalone
+    restart: unless-stopped
+    working_dir: /app/framework
+    env_file:
+      - config.env
+    volumes:
+      # Narrowed bind mount (was `.:/app`): mounting the whole project including
+      # node_modules/dist made Gradle file-watching thrash across thousands of
+      # irrelevant files on Docker Desktop, slowing builds and stealing I/O from
+      # the running game. Only the framework sources are needed here.
+      - ./framework:/app/framework
+      # Persist Gradle downloads/caches in a named volume so repeat startups skip
+      # re-downloading Minecraft + Loom artifacts (major startup speedup).
+      - gradle_cache:/root/.gradle
+    ports:
+      - "8080:8080"
+      - "8079:8080"
+    environment:
+      - MINECRAFT_SERVER=${MINECRAFT_SERVER:-host.docker.internal:25565}
+      - BOT_NAME=${BOT_NAME:-${MINECRAFT_BOT_USERNAME:-Gemini}}
+      - MINECRAFT_BOT_USERNAME=${MINECRAFT_BOT_USERNAME:-${BOT_NAME:-Gemini}}
+      - AI_IPC_PORT=8085
+      # JAVA_TOOL_OPTIONS applies to EVERY JVM in the container (Gradle daemon AND the
+      # game client). Do NOT put a GC flag (-XX:+UseG1GC etc.) here: the game client
+      # also selects its own GC via vmArg in framework/build.gradle, and the JVM aborts
+      # with "Multiple garbage collectors selected" when both are present. The client's
+      # build.gradle already passes -Xms/-Xmx/GC flags itself, so this env var only
+      # needs to cap the Gradle daemon's heap.
+      - JAVA_TOOL_OPTIONS=-Xmx4G -Xms512M -Dfabric.gui.disable=true -XX:+PerfDisableSharedMem
+    # Resources: sized for a smooth client. NOTE: on Docker Desktop (Windows/Mac) these
+    # limits only help if the WSL2/VM total allocation in Docker Settings is raised too
+    # (recommended: 16GB RAM / 8 CPUs for the Docker VM).
+    deploy:
+      resources:
+        limits:
+          cpus: '6.0'      # Headroom left for host + dashboard
+          memory: 8G
+        reservations:
+          cpus: '3.0'      # Guarantee cores so the client isn't throttled under load
+          memory: 5G       # Guarantee so Java never gets squeezed by other containers
+    
+    # Enable hardware acceleration if a GPU is present (requires nvidia-container-toolkit)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    
+    shm_size: '4gb'
+    # Performance tuning:
+    #  - mem_swappiness=0: stop swapping the Java heap out (major cause of GC pauses/lag)
+    #  - ulimit memlock: lets the JVM pin its heap so it is never paged to disk
+    mem_swappiness: 0
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Real OS-level keyboard/mouse via /dev/uinput (used by OsInputInjector.java).
+    # On Docker Desktop for Windows the host kernel is WSL2, which already ships
+    # the uinput module; if it reports "not found", run `modprobe uinput` once in
+    # a "Ubuntu (WSL)" terminal. All of this degrades gracefully if unavailable.
+    # NOTE: no hard `devices:` mapping for /dev/uinput here on purpose.
+    # If the host kernel doesn't expose /dev/uinput (some WSL2/Docker Desktop
+    # setups), a hard device mapping makes container startup fail outright.
+    # The entrypoint below creates it via mknod after loading the module,
+    # and OsInputInjector.java degrades gracefully if it stays unavailable.
+    cap_add:
+      - SYS_MODULE
+    command: >
+      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils gcc libc6-dev > /dev/null 2>&1 || true &&
+               printf '#include <fcntl.h>\n#include <unistd.h>\n#include <sys/ioctl.h>\n#include <linux/uinput.h>\nint main(){int fd=open(\"/dev/uinput\",O_WRONLY);if(fd<0)return 1;return ioctl(fd,UI_DEV_CREATE,0)==0?0:2;}\n' > /tmp/ui.c && (gcc -o /usr/local/bin/uinput-create /tmp/ui.c 2>/dev/null || true) &&
+               mkdir -p /app/framework/run/config &&
+               (modprobe uinput 2>/dev/null || true) &&
+               ([ -e /dev/uinput ] || mknod /dev/uinput c 10 223 2>/dev/null || true) &&
+               kill $(pgrep -f GradleDaemon) 2>/dev/null; kill $(pgrep GradleWorkerMain) 2>/dev/null; sleep 1;
+               ./gradlew --stop > /dev/null 2>&1 || true;
+               find /root/.gradle/caches/fabric-loom -name '*.lock' -delete 2>/dev/null; find /app/framework/.gradle -name '*.lock' -delete 2>/dev/null;
+               rm -rf /app/framework/build/tmp/compileJava 2>/dev/null;
+               rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true &&
+               Xvfb :99 -screen 0 1024x768x16 &
+               export DISPLAY=:99 &&
+               export MINECRAFT_SERVER_HOST=\"$$MINECRAFT_SERVER\" &&
+               export MINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" &&
+               echo '=====================================================' &&
+               echo ' [Standalone Container] Launching Fabric Client (Java 25)' &&
+               echo ' Server   : '\"$$MINECRAFT_SERVER\" &&
+               echo ' Username : '\"$$BOT_NAME\" &&
+               echo '=====================================================' &&
+               chmod +x ./gradlew && 
+               (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon || 
+                (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon))"
+
+  web-dashboard:
+    image: node:22-slim
+    container_name: minecraft-ai-dashboard
+    restart: unless-stopped
+    working_dir: /app
+    env_file:
+      - config.env
+    ports:
+      - "3000:3000"
+    environment:
+      - MINECRAFT_SERVER_HOST=host.docker.internal
+      - MINECRAFT_SERVER_PORT=25565
+      - BRIDGE_HOST=minecraft-standalone-client
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # Startup speed + resource fairness for the dashboard container:
+    #  - node_modules lives in an NAMED volume instead of a host bind mount. On Docker
+    #    Desktop (Windows/Mac) bind-mounted node_modules is ~10-50x slower, which made
+    #    npm install / vite build crawl and starved CPU while the game was running.
+    #  - cpus/mem_limit guarantee the dashboard can't be squeezed to nothing by the
+    #    Minecraft client, and vice-versa.
+    cpus: '2.0'
+    mem_limit: 3g
+    volumes:
+      - .:/app
+      - dashboard_node_modules:/app/node_modules
+    command: >
+      bash -c "echo '=====================================================' &&
+               echo ' [Web Dashboard] Initializing environment...' &&
+               echo '=====================================================' &&
+               apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1 || true &&
+               if [ ! -d node_modules ] || [ package.json -nt node_modules/.install-stamp ]; then
+                 echo 'Installing dependencies (first run only)...' &&
+                 (npm install --prefer-offline --no-audit --no-fund || (echo 'Retrying npm install...' && sleep 5 && npm install --prefer-offline --no-audit --no-fund)) &&
+                 touch node_modules/.install-stamp
+               else
+                 echo 'Dependencies cached in volume - skipping npm install.'
+               fi && 
+               echo '=====================================================' &&
+               echo ' [Web Dashboard] Building Application...' &&
+               echo '=====================================================' &&
+               (npm run build || (echo 'Build failed, trying clean build...' && rm -rf dist && npm run build)) &&
+               echo '=====================================================' &&
+               echo ' [Web Dashboard] Starting Server on port 3000...' &&
+               echo '=====================================================' &&
+               npm start"
+
+volumes:
+  ollama_data:
+  # Gradle dependency + Loom caches (survives container recreation -> fast restarts).
+  # Explicit name so start scripts can reference it deterministically for lock cleanup.
+  gradle_cache:
+    name: minecraft-gradle-cache
+  # Dashboard node_modules kept off the host filesystem for fast npm/vite I/O
+  dashboard_node_modules:
+
+networks:
+  default:
+    name: minecraft-ai-network
