@@ -430,6 +430,7 @@ export default function App() {
   const lastChatReplyTimeRef = useRef<number>(0);
   const userChatPromptActiveRef = useRef<boolean>(false);
   const lastBridgeChatSentTimeRef = useRef<number>(0);
+  const lastBridgeChatTextRef = useRef<string>("");
   // Timestamp of the most recent LIVE telemetry packet received from the Fabric bridge.
   // Gates scans/autonomy so the AI never acts on stale or simulated coordinates.
   const lastLiveTelemetryAtRef = useRef<number>(0);
@@ -447,11 +448,17 @@ export default function App() {
         console.log("[Bridge] Suppressed unprompted autonomous chat message:", action.message);
         return;
       }
-      if (now - lastBridgeChatSentTimeRef.current < 3000) {
-        console.log("[Bridge] Rate-limited chat to prevent server kick:", action.message);
+      if (now - lastBridgeChatSentTimeRef.current < 6000) {
+        console.log("[Bridge] Rate-limited chat to prevent spam/server kick:", action.message);
+        return;
+      }
+      // Dedupe: skip if identical text was the last message sent (re-plans repeat narration)
+      if (lastBridgeChatTextRef.current === String(action.message || "").trim()) {
+        console.log("[Bridge] Suppressed duplicate chat message:", action.message);
         return;
       }
       lastBridgeChatSentTimeRef.current = now;
+      lastBridgeChatTextRef.current = String(action.message || "").trim();
       userChatPromptActiveRef.current = false; // Consumed
     }
 
@@ -2370,6 +2377,18 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
           return t !== "send_chat" && t !== "chat" && t !== "say" && t !== "message" && t !== "speak" && t !== "whisper";
         });
       } else {
+        // Spam guard: at most ONE chat message per dispatched goal. Keep the first
+        // (the real reply), drop mid-task status narration ("Found oak log...",
+        // "Placed stone_bricks...") that re-plays on every autonomy-loop re-plan.
+        let seenChatInGoal = false;
+        safeActions = safeActions.filter((a) => {
+          const t = (a.type || (a as any).action || "").toString().toLowerCase();
+          const isChat = t === "send_chat" || t === "chat" || t === "say" || t === "message" || t === "speak" || t === "whisper";
+          if (!isChat) return true;
+          if (seenChatInGoal) return false;
+          seenChatInGoal = true;
+          return true;
+        });
         // Only reply if this was an actual user chat query
         const hasChatAction = safeActions.some((a) => {
           const t = (a.type || (a as any).action || "").toString().toLowerCase();

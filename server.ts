@@ -1927,6 +1927,144 @@ function mcBlock(name: any): string {
   return n.startsWith("minecraft:") ? n : `minecraft:${n}`;
 }
 
+// ---- Token-aware Minecraft block/item matching -------------------------------
+// Substring matching ("oak_log".includes("log")) made DIFFERENT materials look
+// identical to the planner: expected 'stone' matched inventory 'stone_bricks',
+// generic keyword 'log' matched 'stone_brick_slab' via reverse includes, and oak
+// logs got counted/placed as stone bricks. These helpers match on underscore
+// TOKENS instead: exact ID first, then same-family variants only when a
+// NON-GENERIC token is shared (so 'stone' never bridges to 'stone_bricks', and
+// 'oak_log' never matches 'stone_bricks').
+const GENERIC_BLOCK_TOKENS = new Set([
+  "oak", "birch", "spruce", "jungle", "acacia", "dark_oak", "mangrove", "cherry",
+  "crimson", "warped", "smooth", "polished", "cut", "mossy", "raw", "deepslate",
+  "blackstone", "nether", "old", "new", "normal", "block", "blocks", "item", "items",
+]);
+const FAMILY_BLOCK_TOKENS = new Set([
+  "log", "logs", "wood", "plank", "planks", "slab", "stairs", "fence", "fences",
+  "fence_gate", "gate", "door", "trapdoor", "button", "pressure_plate", "sign",
+  "wall_sign", "beam", "bark", "leaf", "leaves", "brick", "bricks", "ore",
+  "glass", "pane", "panes", "tile", "tiles", "pillar", "pilar",
+]);
+
+function blockTokens(name: string): string[] {
+  return String(name || "").toLowerCase().replace(/^minecraft:/, "").split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** True if two full block IDs refer to the same material family (never across families). */
+function blockNamesCompatible(aRaw: string, bRaw: string): boolean {
+  const a = String(aRaw || "").toLowerCase().replace(/^minecraft:/, "");
+  const b = String(bRaw || "").toLowerCase().replace(/^minecraft:/, "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const at = blockTokens(a), bt = new Set(blockTokens(b));
+  // Family guard: log-family names must never match brick/stone-family names etc.
+  const famOf = (name: string) => {
+    const t = new Set(blockTokens(name));
+    if ([...t].some((x) => /log|wood|stem/.test(x))) return "wood";
+    if ([...t].some((x) => /brick/.test(x))) return "brick";
+    if ([...t].some((x) => /plank/.test(x))) return "plank";
+    if ([...t].some((x) => /glass/.test(x))) return "glass";
+    if ([...t].some((x) => /ore/.test(x))) return "ore";
+    return null;
+  };
+  const fa = famOf(a), fb = famOf(b);
+  if (fa && fb && fa !== fb) return false;
+  // A shared non-generic, non-family token means same material (e.g. cobblestone vs
+  // cobblestone_wall -> "cobblestone"; iron_ore vs raw_iron_block shares "iron").
+  for (const tok of at) {
+    if (bt.has(tok) && !GENERIC_BLOCK_TOKENS.has(tok) && !FAMILY_BLOCK_TOKENS.has(tok)) return true;
+  }
+  // Variant suffixes: mossy_cobblestone ~ cobblestone (one is a pure subset with extras only generic)
+  const extraA = at.filter((t) => !bt.has(t));
+  const bAsSet = new Set(at);
+  const extraB = [...bt].filter((t) => !bAsSet.has(t));
+  const shorterFirst = at.length <= [...bt].length;
+  const extras = shorterFirst ? extraB : extraA;
+  const base = shorterFirst ? at : [...bt];
+  const other = shorterFirst ? new Set(bt) : bAsSet;
+  if (base.every((t) => other.has(t)) && extras.length > 0 &&
+      extras.every((t) => GENERIC_BLOCK_TOKENS.has(t) || FAMILY_BLOCK_TOKENS.has(t))) {
+    return true;
+  }
+  return false;
+}
+
+/** Does a user/goal keyword (e.g. 'oak_log', 'log', 'stone') refer to this voxel block? */
+function keywordMatchesBlock(kwRaw: string, blockNameRaw: string): boolean {
+  const kw = String(kwRaw || "").toLowerCase().replace(/^minecraft:/, "").replace(/\s+/g, "_");
+  const bn = String(blockNameRaw || "").toLowerCase().replace(/^minecraft:/, "");
+  if (!kw || !bn) return false;
+  if (kw === bn) return true;
+  // Multi-token keyword (specific like 'oak_log'): delegate to family-compatible check.
+  if (kw.includes("_")) return blockNamesCompatible(kw, bn);
+  // Single generic keyword ('log', 'stone', 'wood'): only matches blocks whose OWN
+  // tokens contain it AND that are not a different named material. e.g. 'stone'
+  // matches stone / smooth_stone / stone_bricks but NOT cobblestone; 'log' matches
+  // oak_log but NOT stone_brick_slab.
+  const bt = blockTokens(bn);
+  if (!bt.includes(kw)) return false;
+  if (["log", "wood", "stem"].includes(kw)) return bt.some((t) => /log|wood|stem/.test(t));
+  if (kw === "brick") return bt.some((t) => /brick/.test(t));
+  if (kw === "plank") return bt.some((t) => /plank/.test(t));
+  if (kw === "ore") return bt.includes("ore");
+  return true;
+}
+
+/** Is an item ID placeable as a block (not air/tool/weapon/armor/food)? */
+function isPlaceableBlockItem(itemRaw: any): boolean {
+  const s = String(itemRaw?.item ?? itemRaw ?? "").toLowerCase().replace(/^minecraft:/, "");
+  if (!s || s === "air") return false;
+  if (typeof itemRaw?.isBlock === "boolean") return itemRaw.isBlock;
+  if (/pickaxe|axe(?!_)|sword|shovel|hoe|bow|crossbow|shield|helmet|chestplate|leggings|boots|elytra|stick|apple|bread|meat|cooked|potion|bucket|tnt|flint_and_steel|shears|rod|fishing/.test(s) && !/_planks|_log|_slab|_stairs|torch/.test(s)) return false;
+  if (s === "stick" || s.endsWith("_sword") || s.endsWith("_pickaxe") || s.endsWith("_axe") || s.endsWith("_shovel") || s.endsWith("_hoe")) return false;
+  return true;
+}
+
+/** Reconstructs the REAL 9-slot hotbar from telemetry when player.hotbar is empty.
+ *  The Fabric bridge often exports only `inventory` + `selected_slot` + `main_hand`,
+ *  leaving player.hotbar as [] - which previously made every slot lookup default to
+ *  slot 0 (air / hand, or an axe) and caused "placing its hand" behavior. */
+function getEffectiveHotbar(telemetry: any): any[] {
+  const player = telemetry?.player || telemetry || {};
+  const isArmorName = (name: any) => {
+    const s = String(name || "").toLowerCase();
+    return s.includes("helmet") || s.includes("chestplate") || s.includes("leggings") ||
+      s.includes("boots") || s.includes("elytra") || s.includes("turtle_helmet");
+  };
+  let hb: any[] = Array.isArray(player.hotbar) ? player.hotbar.filter((s: any) => s && String(s.item || "") !== "" ) : [];
+  if (hb.length === 0 && Array.isArray(telemetry?.inventory)) {
+    hb = Array.from({ length: 9 }).map((_, i) => {
+      const found = telemetry.inventory.find((inv: any) =>
+        inv &&
+        inv.region !== "armor" && inv.region !== "equipment" && inv.region !== "offhand" &&
+        (inv.slot === i || inv.slot === i + 36 || (inv.region === "hotbar" && (inv.slot === i || inv.slot === -1))) &&
+        !isArmorName(inv.item || inv.name)
+      );
+      return found ? { slot: i, item: found.item || found.name, count: found.count || 1 } : { slot: i, item: "minecraft:air", count: 0 };
+    });
+  } else if (hb.length > 0) {
+    // Pad to 9 slots and sanitize armor miscategorized into slots 1-4.
+    hb = Array.from({ length: 9 }).map((_, i) => {
+      const s = hb[i];
+      if (!s || !s.item || s.item === "minecraft:air") return { slot: i, item: "minecraft:air", count: 0 };
+      if (i >= 1 && i <= 4 && isArmorName(s.item)) return { slot: i, item: "minecraft:air", count: 0 };
+      return s;
+    });
+  } else {
+    hb = Array.from({ length: 9 }).map((_, i) => ({ slot: i, item: "minecraft:air", count: 0 }));
+  }
+  // Ground-truth override: main_hand / selected_slot from the bridge beats guessed arrays.
+  const selIdx = Number(player.selectedSlot ?? player.selected_slot ?? 0);
+  const mainHand = player.main_hand?.item || player.heldItem?.item;
+  if (mainHand && String(mainHand).toLowerCase() !== "minecraft:air" && selIdx >= 0 && selIdx <= 8) {
+    if (!hb[selIdx] || String(hb[selIdx].item || "").toLowerCase() === "minecraft:air" || hb[selIdx].count === 0) {
+      hb[selIdx] = { slot: selIdx, item: mainHand, count: player.main_hand?.count ?? player.heldItem?.count ?? 1 };
+    }
+  }
+  return hb;
+}
+
 // Last good live cube map captured by the server (real-world ground truth). Reused briefly
 // when the bridge is mid-scan so plans never fall back to simulated terrain while in-game.
 let lastGoodLiveCubeMap: any = null;
@@ -2686,9 +2824,11 @@ Chat History: ${JSON.stringify(chatHistory || [])}`;
     const findNearest = (x: number, y: number, z: number, blockName?: string) => {
       let pool = vox;
       if (blockName) {
-        const clean = String(blockName).replace(/^minecraft:/, "");
+        const clean = String(blockName).replace(/^minecraft:/, "").toLowerCase();
         const exact = vox.filter((v: any) => v.name === clean);
-        const partial = vox.filter((v: any) => v.name.includes(clean) || clean.includes(v.name));
+        // Token-aware family match: prevents 'oak_log' being counted as 'stone_bricks'
+        // and generic 'stone' matching 'stone_bricks'. Only same-family variants accepted.
+        const partial = exact.length === 0 ? vox.filter((v: any) => blockNamesCompatible(clean, v.name)) : [];
         pool = exact.length > 0 ? exact : (partial.length > 0 ? partial : []);
       }
       if (pool.length === 0) return null;
@@ -3275,7 +3415,9 @@ function solveServerHeuristicPlan(
     if (voxList.length === 0) return null;
     const kws = mentionedKw.length > 0 ? mentionedKw : ["log", "wood", "ore"];
     for (const kw of kws) {
-      const pool = voxList.filter((v: any) => v.name.includes(kw) || kw.includes(v.name));
+      // Token-aware match so generic keywords ('log', 'stone') never bridge to a
+      // DIFFERENT material family (e.g. oak_log must not match stone_bricks).
+      const pool = voxList.filter((v: any) => keywordMatchesBlock(kw, v.name));
       if (pool.length > 0) {
         return pool.sort((a: any, b: any) => distTo(absVoxel(a), player) - distTo(absVoxel(b), player))[0];
       }
@@ -3403,12 +3545,12 @@ function solveServerHeuristicPlan(
     const missing = Array.isArray(litematicaDiff) ? litematicaDiff.find((d: any) => d.type === "MISSING") : null;
     if (missing) {
       const expClean = String(missing.expectedBlock || "").replace(/^minecraft:/, "").toLowerCase();
-      const hb = Array.isArray(player?.hotbar) ? player.hotbar : [];
+      const hb = getEffectiveHotbar(telemetry);
       let targetSlot = hb.findIndex((s: any) => {
         const item = String(s?.item || "").replace(/^minecraft:/, "").toLowerCase();
-        return item === expClean || item.includes(expClean) || expClean.includes(item);
+        return blockNamesCompatible(item, expClean) && isPlaceableBlockItem(s);
       });
-      if (targetSlot === -1) targetSlot = 0;
+      if (targetSlot === -1) targetSlot = -1; // no material in real hotbar - handled below
 
       const dx = Number(missing.x) + 0.5 - Number(player.x || 0);
       const dy = Number(missing.y) + 0.5 - Number(player.y || 0);
@@ -3432,13 +3574,17 @@ function solveServerHeuristicPlan(
           { type: "look_at", x: scafX + 0.5, y: scafY + 0.5, z: scafZ + 0.5, ticks: 2 },
           { type: "press_key", key: "space", durationMs: 250 }
         );
-      } else {
+      } else if (targetSlot >= 0) {
         thought += ` Schematic diff: placing expected '${missing.expectedBlock}' at [${missing.x}, ${missing.y}, ${missing.z}] using hotbar slot ${targetSlot}.`;
         actions.push(
           { type: "select_hotbar", slot: targetSlot },
           { type: "look_at", x: Number(missing.x) + 0.5, y: Number(missing.y) + 0.5, z: Number(missing.z) + 0.5, ticks: 4 },
           { type: "place_block", hand: "main", x: Math.floor(Number(missing.x)), y: Math.floor(Number(missing.y)), z: Math.floor(Number(missing.z)), side: "up" }
         );
+      } else {
+        // NEVER place with slot 0 blindly - that is often the empty hand or an axe.
+        // Honest no-op: report missing material instead of placing air/tools as blocks.
+        thought += ` Schematic needs '${expClean}' but it is NOT in the real hotbar - skipping placement to avoid placing hand/tool.`;
       }
     } else {
       thought += ` Construction intent: all schematic diffs satisfied or no blueprint diff provided.`;
@@ -3481,12 +3627,12 @@ function solveServerHeuristicPlan(
 
 // Built-in helpers: tool selection, mining duration, hotbar label fallback.
 function hotbarLabel(player: any): string {
-  const hb = Array.isArray(player?.hotbar) ? player.hotbar : [];
-  const sel = player?.selectedSlot ?? 0;
+  const hb = getEffectiveHotbar({ player });
+  const sel = player?.selectedSlot ?? player?.selected_slot ?? 0;
   return hb[sel]?.item || hb[0]?.item || "";
 }
 function pickToolSlot(telemetry: any, blockName: string): number {
-  const hb = Array.isArray(telemetry?.player?.hotbar) ? telemetry.player.hotbar : [];
+  const hb = getEffectiveHotbar(telemetry);
   const name = String(blockName).toLowerCase();
   const needsPickaxe = /ore|stone|cobble|iron|gold|diamond|coal|emerald|copper|obsidian|deepslate/.test(name);
   const needsAxe = /log|wood|plank/.test(name);
@@ -3496,7 +3642,11 @@ function pickToolSlot(telemetry: any, blockName: string): number {
     const idx = hb.findIndex((s: any) => String(s?.item || "").toLowerCase().includes(tool));
     if (idx >= 0) return idx;
   }
-  return 0;
+  // No matching tool: keep whatever is actually held (real selected slot) instead of
+  // forcing slot 0 - slot 0 may be air (hand) or an unrelated item.
+  const player = telemetry?.player || {};
+  const sel = Number(player.selectedSlot ?? player.selected_slot ?? 0);
+  return sel >= 0 && sel <= 8 ? sel : 0;
 }
 function estimateMineTime(blockName: string): number {
   const n = String(blockName).toLowerCase();
@@ -3513,8 +3663,8 @@ function postProcessPlanWithLearning(result: any, req: any): any {
   
   const telemetry = req.body?.telemetry || {};
   const player = telemetry.player || {};
-  const hotbar = Array.isArray(player.hotbar) ? player.hotbar : [];
-  const selectedSlot = player.selectedSlot ?? 0;
+  const hotbar = getEffectiveHotbar(telemetry);
+  const selectedSlot = player.selectedSlot ?? player.selected_slot ?? 0;
   let activeHeldItem = (hotbar[selectedSlot]?.item || player.heldItem?.item || player.main_hand?.item || "air").replace(/^minecraft:/, "");
   const goal = (req.body?.goal || "").toLowerCase();
   const raycast = telemetry.raycast || {};
@@ -3567,15 +3717,41 @@ function postProcessPlanWithLearning(result: any, req: any): any {
     }
   }
 
-  // Resolved target hint: look_at block / action block / goal block > raycast block > default oak_log
-  const targetHint = currentTargetBlock || (raycast.type === "BLOCK" && raycast.block ? raycast.block.replace(/^minecraft:/, "") : "oak_log");
+  // Resolved target hint: look_at block / action block / goal block > raycast block.
+  // NEVER default to "oak_log" - that made stone-brick houses get mined/counted as logs.
+  const targetHint = currentTargetBlock || (raycast.type === "BLOCK" && raycast.block ? raycast.block.replace(/^minecraft:/, "") : "");
 
   const failureAlerts: string[] = [];
+  let pendingPlaceSlot: number | null = null;
   for (const act of result.actions) {
     if (act.type === "select_hotbar" && typeof act.slot === "number") {
       const slotItem = hotbar[act.slot]?.item;
       if (slotItem) {
         activeHeldItem = slotItem.replace(/^minecraft:/, "");
+      }
+      pendingPlaceSlot = act.slot;
+    }
+
+    // Guard: never place a block while the selected hotbar slot holds air (the bare
+    // hand) or a tool/weapon (e.g. an axe). Re-point at a real block stack if one
+    // exists, otherwise drop the placement instead of spamming use-clicks with junk.
+    if (act.type === "place_block") {
+      const slotIdx = pendingPlaceSlot ?? selectedSlot;
+      const held = hotbar[slotIdx];
+      if (!isPlaceableBlockItem(held)) {
+        const matSlot = hotbar.findIndex((s: any) => isPlaceableBlockItem(s) && Number(s?.count || 0) > 0);
+        if (matSlot >= 0) {
+          if (pendingPlaceSlot !== null) { /* rewrite the preceding select_hotbar */ }
+          // Insert corrected selection just before this placement by mutating the
+          // preceding select_hotbar action when present, else emit a new one here.
+          const prevSel = result.actions.find((a: any, i: number) => i < result.actions.indexOf(act) && a.type === "select_hotbar");
+          if (prevSel) prevSel.slot = matSlot;
+          else act.select_slot_first = matSlot;
+          activeHeldItem = String(hotbar[matSlot].item).replace(/^minecraft:/, "");
+        } else {
+          act.__drop = true; // no placeable material at all - skip this placement
+          failureAlerts.push(`Dropped place_block at [${act.x},${act.y},${act.z}]: hotbar has no block item (would have placed ${held?.item || "air"}).`);
+        }
       }
     }
 
@@ -3596,6 +3772,20 @@ function postProcessPlanWithLearning(result: any, req: any): any {
       failureAlerts.push(check.message);
     }
   }
+
+  // Remove placements flagged as unsafe (air/tool in hand with no block material available)
+  result.actions = result.actions.filter((a: any) => !a.__drop);
+
+  // Chat spam guard for ALL providers (NVIDIA/Gemini/Groq/OpenRouter/Ollama/built-in):
+  // a plan may narrate at most ONE chat message; keep the first meaningful one.
+  let chatKept = false;
+  result.actions = result.actions.filter((a: any) => {
+    const t = String(a?.type || "").toLowerCase();
+    if (t !== "send_chat" && t !== "chat" && t !== "say" && t !== "message") return true;
+    if (chatKept) return false;
+    chatKept = true;
+    return true;
+  });
 
   if (failureAlerts.length > 0) {
     const alertMsg = failureAlerts.join(" | ");

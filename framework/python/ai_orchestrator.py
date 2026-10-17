@@ -490,8 +490,32 @@ class MinecraftAiOrchestrator:
         target_slot = -1
         expected_item_id = expected_block  # e.g. "minecraft:obsidian"
         
+        def _block_tokens(name):
+            import re as _re
+            return [t for t in _re.split(r"[^a-z0-9]+", str(name or "").lower().replace("minecraft:", "")) if t]
+
+        _exp_tok = set(_block_tokens(expected_item_id))
+        _GENERIC = {"oak", "birch", "spruce", "jungle", "acacia", "dark", "smooth",
+                    "polished", "cut", "mossy", "raw", "block", "blocks", "slab",
+                    "stairs", "log", "wood", "plank", "planks", "brick", "bricks",
+                    "fence", "gate", "door", "pane", "panes", "glass", "ore"}
         for slot in hotbar:
-            if expected_item_id in slot.get("item", ""):
+            item_name = str(slot.get("item", "") or "")
+            if not item_name or item_name == "minecraft:air":
+                continue
+            # Token-aware exact/family match: prevents 'minecraft:stone' matching a
+            # 'stone_bricks' stack (and oak logs counting as stone bricks, etc.)
+            it_tok = set(_block_tokens(item_name))
+            if it_tok == _exp_tok:
+                target_slot = slot["slot"]
+                break
+            # Family guard: wood-family items must never satisfy stone/brick requests.
+            _fam = lambda ts: ("wood" if ts & {"log", "wood"} else
+                               "brick" if any("brick" in t for t in ts) else
+                               "plank" if any("plank" in t for t in ts) else "other")
+            if _fam(it_tok) != _fam(_exp_tok):
+                continue
+            if (it_tok & _exp_tok) - _GENERIC:
                 target_slot = slot["slot"]
                 break
 

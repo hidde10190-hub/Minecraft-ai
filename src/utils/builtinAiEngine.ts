@@ -8,6 +8,7 @@ import {
   ChatMessage,
   BlockCubeMap
 } from "../types";
+import { blockNamesCompatible, isPlaceableBlockItem } from "./blockMatch";
 
 export interface BuiltinPlanResult {
   thought: string;
@@ -42,7 +43,10 @@ export function solveBuiltinTacticalPlan(
 
   // 1. Inspect recent chat message if present
   const latestChat = chatHistory.length > 0 ? chatHistory[chatHistory.length - 1] : null;
-  const isChatTrigger = lowerGoal.includes("chat") || lowerGoal.includes("say") || lowerGoal.includes("!") || !!latestChat;
+  // Only narrate chat when the USER directly asked/spoke - never on every autonomous
+  // build/mine cycle (this was the source of in-game chat spam while designing houses).
+  const isChatTrigger = lowerGoal.includes("chat message received") || lowerGoal.includes("received from") ||
+    lowerGoal.includes("User chat command") || lowerGoal.includes("say:") || lowerGoal.includes("Reply to");
   rulesEvaluated++;
 
   // 2. Role Capability Matrix
@@ -169,11 +173,12 @@ export function solveBuiltinTacticalPlan(
 
       thought += `Litematica schematic diff active: placing '${missingBlock.expectedBlock}' at [${missingBlock.x}, ${missingBlock.y}, ${missingBlock.z}].`;
 
-      // 2. Find matching material in hotbar with flexible matching
+      // 2. Find matching material in hotbar (token-aware: 'stone' must never match
+      // 'stone_bricks' stacks and 'oak_log' must never match brick/other-family blocks)
       let matSlot = player.hotbar.findIndex((h) => {
         if (!h || h.count <= 0) return false;
         const itemClean = h.item.replace(/^minecraft:/, "").toLowerCase();
-        return itemClean === expClean || itemClean.includes(expClean) || expClean.includes(itemClean);
+        return blockNamesCompatible(itemClean, expClean);
       });
       
       // If not in hotbar, check inventory and swap if possible
@@ -181,7 +186,7 @@ export function solveBuiltinTacticalPlan(
         const invSlot = player.inventory.findIndex((h) => {
           if (!h || h.count <= 0) return false;
           const itemClean = h.item.replace(/^minecraft:/, "").toLowerCase();
-          return itemClean === expClean || itemClean.includes(expClean) || expClean.includes(itemClean);
+          return blockNamesCompatible(itemClean, expClean);
         });
         if (invSlot !== -1) {
           actions.push({ type: "swap_inventory_to_hotbar", fromSlot: invSlot, toSlot: 0 });
@@ -189,10 +194,14 @@ export function solveBuiltinTacticalPlan(
         }
       }
 
-      // If still not present in hotbar, dynamically equip expected block into selected slot
+      // If still not present in hotbar, do NOT blindly use slot 0 (that is often the
+      // bare hand or an axe). Equip the material explicitly first via the bridge.
       if (matSlot === -1) {
-        matSlot = 0;
-        actions.push({ type: "equip_item", item: missingBlock.expectedBlock, slot: 0 });
+        actions.push({ type: "equip_item", item: missingBlock.expectedBlock, slot: player.selectedSlot ?? 0 });
+        matSlot = player.selectedSlot ?? 0;
+      } else if (!isPlaceableBlockItem(player.hotbar[matSlot])) {
+        // Matched slot holds a tool/air - refuse to place it as a block.
+        actions.push({ type: "equip_item", item: missingBlock.expectedBlock, slot: matSlot });
       }
 
       actions.push({ type: "select_hotbar", slot: matSlot });
