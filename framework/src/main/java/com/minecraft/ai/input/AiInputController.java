@@ -13,15 +13,18 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.resources.ResourceLocation;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.item.crafting.RecipeHolder;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.entity.player.Inventory;
 import net.minecraft.world.inventory.AbstractContainerMenu;
-import net.minecraft.world.inventory.ClickType;
-import net.minecraft.world.item.ArmorItem;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.crafting.CraftingRecipe;
@@ -555,8 +558,8 @@ public class AiInputController {
                 return;
             }
             Inventory inv = player.getInventory();
-            Item target = BuiltInRegistries.ITEM.get(ResourceLocation.parse(itemId));
-            if (target == net.minecraft.world.item.Items.AIR) {
+            Item target = BuiltInRegistries.ITEM.getValue(Identifier.parse(itemId));
+            if (target == null || target == net.minecraft.world.item.Items.AIR) {
                 LOGGER.warn("[AiInputController] Unknown item id '{}'", itemId);
                 return;
             }
@@ -580,12 +583,18 @@ public class AiInputController {
             LocalPlayer player = client.player;
             if (player == null) return;
             Inventory inv = player.getInventory();
-            Item target = BuiltInRegistries.ITEM.get(ResourceLocation.parse(itemId));
-            if (!(target instanceof ArmorItem armor)) {
-                LOGGER.warn("[AiInputController] Item '{}' is not an armor piece", itemId);
+            Item target = BuiltInRegistries.ITEM.getValue(Identifier.parse(itemId));
+            if (target == null) {
+                LOGGER.warn("[AiInputController] Unknown item id '{}'", itemId);
                 return;
             }
-            EquipmentSlot eq = armor.getEquipmentSlot();
+            // In MC 26.2 armor pieces are items carrying a trim/armor component rather than a
+            // dedicated ArmorItem subclass; resolve the target equipment slot from the item id.
+            EquipmentSlot eq = resolveArmorSlot(target, itemId);
+            if (eq == null) {
+                LOGGER.warn("[AiInputController] Item '{}' is not an equippable armor piece", itemId);
+                return;
+            }
             int armorInvSlot = switch (eq) {
                 case FEET -> 36;
                 case LEGS -> 37;
@@ -599,14 +608,26 @@ public class AiInputController {
                 if (!stack.isEmpty() && stack.is(target)) {
                     ItemStack current = inv.getItem(armorInvSlot);
                     inv.setItem(armorInvSlot, stack.split(1));
-                    if (!current.isEmpty()) inv.addItem(current);
+                    if (!current.isEmpty()) inv.add(current);
                     inv.setChanged();
-                    LOGGER.info("[AiInputController] Equipped {} into {}", itemId, eq.getName());
+                    LOGGER.info("[AiInputController] Equipped {} into {}", itemId, eq);
                     return;
                 }
             }
             LOGGER.warn("[AiInputController] Armor '{}' not found in inventory", itemId);
         });
+    }
+
+    /** Maps an armor item to its EquipmentSlot by inspecting the vanilla item id. */
+    private static EquipmentSlot resolveArmorSlot(Item item, String itemId) {
+        String path = itemId.contains(":") ? itemId.substring(itemId.indexOf(':') + 1) : itemId;
+        if (path.endsWith("_helmet")) return EquipmentSlot.HEAD;
+        if (path.endsWith("_chestplate")) return EquipmentSlot.CHEST;
+        if (path.endsWith("_leggings")) return EquipmentSlot.LEGS;
+        if (path.endsWith("_boots")) return EquipmentSlot.FEET;
+        // Elytra-like / generic chest armor fallback
+        if (path.equals("elytra")) return EquipmentSlot.CHEST;
+        return null;
     }
 
     private static boolean isValidInvSlot(int slot) {
@@ -626,32 +647,39 @@ public class AiInputController {
         Minecraft client = Minecraft.getInstance();
         JsonArray arr = new JsonArray();
         try {
-            RecipeManager manager = null;
-            if (client.level != null) manager = client.level.getRecipeManager();
-            else if (client.getConnection() != null) manager = client.getConnection().getRecipeManager();
-            if (manager == null) return "[]";
-            for (ResourceLocation loc : manager.keySet()) {
-                var holderOpt = manager.byKey(loc);
-                if (holderOpt.isEmpty()) continue;
-                Recipe<?> recipe = holderOpt.get().value();
+            // MC 26.2: recipes live in the dynamic recipe registry, reachable from the
+            // client via level.registryAccess().lookupOrThrow(Registries.RECIPE).
+            HolderLookup.RegistryLookup<Recipe<?>> rl = null;
+            if (client.level != null) {
+                rl = client.level.registryAccess().lookupOrThrow(Registries.RECIPE);
+            }
+            if (rl == null) return "[]";
+            for (ResourceKey<Recipe<?>> key : rl.listElementIds().toList()) {
+                Recipe<?> recipe = rl.getOrThrow(key).value();
                 if (!(recipe instanceof CraftingRecipe craft)) continue;
+                Identifier loc = key.identifier();
                 JsonObject r = new JsonObject();
                 r.addProperty("id", loc.toString());
                 r.addProperty("type", BuiltInRegistries.RECIPE_SERIALIZER.getKey(craft.getSerializer()).toString());
-                ItemStack result = craft.getResultItem(null);
+                ItemStack result = previewResult(craft, client);
                 if (!result.isEmpty()) {
                     r.addProperty("result_item", BuiltInRegistries.ITEM.getKey(result.getItem()).toString());
                     r.addProperty("result_count", result.getCount());
                 }
                 JsonArray ingredients = new JsonArray();
-                List<Ingredient> ingList = craft.getIngredients();
+                List<Ingredient> ingList = craft.placementInfo().ingredients();
                 for (int i = 0; i < ingList.size(); i++) {
                     Ingredient ing = ingList.get(i);
                     if (ing.isEmpty()) continue;
                     JsonArray opts = new JsonArray();
-                    for (ItemStack opt : ing.items()) {
-                        if (!opt.isEmpty()) opts.add(BuiltInRegistries.ITEM.getKey(opt.getItem()).toString());
-                    }
+                    // MC 26.2: Ingredient.items() returns Stream<Holder<Item>>
+                    ing.items().forEach(h -> {
+                        Item it = h.value();
+                        if (it != null && it != net.minecraft.world.item.Items.AIR) {
+                            Identifier k = BuiltInRegistries.ITEM.getKey(it);
+                            if (k != null) opts.add(k.toString());
+                        }
+                    });
                     if (opts.size() > 0) {
                         JsonObject o = new JsonObject();
                         o.addProperty("slot", i);
@@ -668,6 +696,16 @@ public class AiInputController {
         return GSON.toJson(arr);
     }
 
+    /** Best-effort result-item preview; falls back to assembling with an empty grid. */
+    private static ItemStack previewResult(CraftingRecipe craft, Minecraft client) {
+        try {
+            // MC 26.2: Recipe.assemble now takes only the RecipeInput.
+            return craft.assemble(net.minecraft.world.item.crafting.CraftingInput.EMPTY);
+        } catch (Exception e) {
+            return ItemStack.EMPTY;
+        }
+    }
+
     /**
      * Crafts a recipe identified by its vanilla recipe id (e.g. "minecraft:chest") using the
      * game's built-in RecipeManager data. Requires the player to have the ingredients and an
@@ -680,9 +718,18 @@ public class AiInputController {
         client.execute(() -> {
             LocalPlayer player = client.player;
             if (player == null || client.level == null || client.gameMode == null) return;
-            RecipeManager manager = client.level.getRecipeManager();
-            ResourceLocation loc = ResourceLocation.parse(recipeId.contains(":") ? recipeId : "minecraft:" + recipeId);
-            var holderOpt = manager.byKey(loc);
+            Identifier loc = Identifier.parse(recipeId.contains(":") ? recipeId : "minecraft:" + recipeId);
+            ResourceKey<Recipe<?>> recipeKey = ResourceKey.create(Registries.RECIPE, loc);
+            java.util.Optional<RecipeHolder<?>> holderOpt;
+            try {
+                HolderLookup.RegistryLookup<Recipe<?>> lookup =
+                        client.level.registryAccess().lookupOrThrow(Registries.RECIPE);
+                // MC 26.2: HolderGetter.get(ResourceKey) -> Optional<Holder.Reference<T>>
+                var h = lookup.get(recipeKey);
+                holderOpt = h.map(hr -> new RecipeHolder<>(recipeKey, hr.value()));
+            } catch (Exception e) {
+                holderOpt = java.util.Optional.empty();
+            }
             if (holderOpt.isEmpty()) {
                 LOGGER.warn("[AiInputController] Unknown recipe '{}'", recipeId);
                 return;
@@ -701,7 +748,8 @@ public class AiInputController {
                         new BlockHitResult(center, Direction.UP, tablePos, false));
             }
 
-            Screen screen = client.screen;
+            // MC 26.2: Minecraft.screen field moved behind Gui#screen()
+            Screen screen = client.gui.screen();
             if (!(screen instanceof AbstractContainerScreen<?> cs)) {
                 LOGGER.warn("[AiInputController] No crafting screen open (no crafting table nearby?). Recipe: {}", recipeId);
                 return;
@@ -710,41 +758,51 @@ public class AiInputController {
             final int containerId = menu.containerId;
 
             // Locate the crafting grid + result slots using the vanilla menu layouts:
-            //   InventoryMenu / CraftingMenu (2x2): slot 0 = result, slots 1-4 = grid, 5+ = player inv
-            //   CraftingTableMenu (3x3):             slot 0 = result, slots 1-9 = grid, 10+ = player inv
-            String menuCls = menu.getClass().getSimpleName();
-            int gridSize = (menuCls.contains("CraftingTable") || menuCls.contains("Stonecutter") || menu.slots.size() >= 74) ? 9 : 4;
-            int resultSlot = -1, gridStart = -1;
-            for (int i = 0; i < Math.min(2, menu.slots.size()); i++) {
-                String cls = menu.slots.get(i).getClass().getSimpleName();
-                if (cls.contains("Result")) { resultSlot = i; break; }
+            //   InventoryMenu (2x2): RESULT_SLOT/CRAFT_SLOT_START/CRAFT_SLOT_COUNT constants
+            //   CraftingMenu  (3x3): RESULT_SLOT constant, grid follows at slot 1..9
+            int gridSize = 4, resultSlot = -1, gridStart = -1;
+            if (menu instanceof net.minecraft.world.inventory.CraftingMenu) {
+                resultSlot = net.minecraft.world.inventory.CraftingMenu.RESULT_SLOT;
+                gridStart = resultSlot + 1;
+                gridSize = 9;
+            } else if (menu instanceof net.minecraft.world.inventory.InventoryMenu invMenu) {
+                resultSlot = net.minecraft.world.inventory.InventoryMenu.RESULT_SLOT;
+                gridStart = net.minecraft.world.inventory.InventoryMenu.CRAFT_SLOT_START;
+                gridSize = net.minecraft.world.inventory.InventoryMenu.CRAFT_SLOT_COUNT;
+            } else {
+                // Generic fallback: scan the first two slots for a ResultSlot-named class
+                String menuCls = menu.getClass().getSimpleName();
+                gridSize = (menuCls.contains("CraftingTable") || menu.slots.size() >= 74) ? 9 : 4;
+                for (int i = 0; i < Math.min(2, menu.slots.size()); i++) {
+                    String cls = menu.slots.get(i).getClass().getSimpleName();
+                    if (cls.contains("Result")) { resultSlot = i; break; }
+                }
+                if (resultSlot == 0) gridStart = 1;
             }
-            if (resultSlot == 0) gridStart = 1;
             if (resultSlot < 0 || gridStart < 0) {
                 LOGGER.warn("[AiInputController] Could not locate crafting grid/result slots in open menu ({})",
                         menu.getClass().getSimpleName());
                 return;
             }
 
-            // Map each grid cell to an inventory slot holding a matching ingredient
-            List<Ingredient> ingredients = craft.getIngredients();
+            // Map each grid cell to an inventory slot holding a matching ingredient.
+            // MC 26.2: use placementInfo().ingredients(); Ingredient.items() is now a
+            // Stream<Holder<Item>>, so we skip stream iteration entirely and match the
+            // player's inventory slots directly with Ingredient.test(stack).
+            List<Ingredient> ingredients = craft.placementInfo().ingredients();
             java.util.Set<Integer> usedInvSlots = new java.util.HashSet<>();
             int[] plan = new int[9];
             java.util.Arrays.fill(plan, -1);
             for (int g = 0; g < Math.min(9, ingredients.size()); g++) {
                 Ingredient ing = ingredients.get(g);
                 if (ing.isEmpty()) continue;
-                outer:
-                for (ItemStack match : ing.items()) {
-                    if (match.isEmpty()) continue;
-                    for (int s = 0; s < 36; s++) {
-                        if (usedInvSlots.contains(s)) continue;
-                        ItemStack have = player.getInventory().getItem(s);
-                        if (!have.isEmpty() && ing.test(have)) {
-                            plan[g] = s;
-                            usedInvSlots.add(s);
-                            break outer;
-                        }
+                for (int s = 0; s < 36; s++) {
+                    if (usedInvSlots.contains(s)) continue;
+                    ItemStack have = player.getInventory().getItem(s);
+                    if (!have.isEmpty() && ing.test(have)) {
+                        plan[g] = s;
+                        usedInvSlots.add(s);
+                        break;
                     }
                 }
                 if (plan[g] < 0) {
@@ -753,14 +811,15 @@ public class AiInputController {
                 }
             }
 
-            // Fill the grid via simulated clicks, then collect the result
-            for (int g = 0; g < 9; g++) {
+            // Fill the grid via simulated clicks, then collect the result.
+            // MC 26.2: handleInventoryMouseClick -> handleContainerInput(..., ContainerInput.PICKUP, ...)
+            for (int g = 0; g < Math.min(9, gridSize); g++) {
                 if (plan[g] < 0) continue;
-                client.gameMode.handleInventoryMouseClick(containerId, invSlotToMenuSlot(menu, plan[g]), 0, ClickType.PICKUP, player);
-                client.gameMode.handleInventoryMouseClick(containerId, gridStart + g, 0, ClickType.PICKUP, player);
+                client.gameMode.handleContainerInput(containerId, invSlotToMenuSlot(menu, plan[g]), 0, ContainerInput.PICKUP, player);
+                client.gameMode.handleContainerInput(containerId, gridStart + g, 0, ContainerInput.PICKUP, player);
             }
-            client.gameMode.handleInventoryMouseClick(containerId, resultSlot, 0, ClickType.PICKUP, player);
-            client.gameMode.handleInventoryMouseClick(containerId, resultSlot, 0, ClickType.PICKUP, player);
+            client.gameMode.handleContainerInput(containerId, resultSlot, 0, ContainerInput.PICKUP, player);
+            client.gameMode.handleContainerInput(containerId, resultSlot, 0, ContainerInput.PICKUP, player);
             LOGGER.info("[AiInputController] Crafted '{}' via the game's built-in recipe book", recipeId);
         });
     }

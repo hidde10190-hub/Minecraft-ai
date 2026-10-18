@@ -977,7 +977,7 @@ public class GameStateExporter {
                         Minecraft mcSwap = Minecraft.getInstance();
                         if (mcSwap.player != null) {
                             for (int i = 9; i < 36; i++) {
-                                if (!mcSwap.player.getInventory().items.get(i).isEmpty()) {
+                                if (!mcSwap.player.getInventory().getItem(i).isEmpty()) {
                                     controller.moveInventorySlot(i, hotbarSlot, swap);
                                     break;
                                 }
