@@ -30,6 +30,8 @@ import { normalizeLivePlayerState, normalizeLiveHotbar } from "./utils/playerSta
 import { loadSavedEnvConfig, persistEnvConfig, fetchServerEnvConfig } from "./utils/envConfigManager";
 import { evaluateMessageForSwarm } from "./utils/signAndMessageIntelligence";
 import { CognitiveFeedbackEngine } from "./utils/cognitiveFeedbackEngine";
+import { blockNamesCompatible, isExactBlockMatch, isPlaceableBlockItem } from "./utils/blockMatch";
+import { buildMemoryBriefingLocal, noteResourceSightingLocal, recordJournalLocal, noteProjectDoneLocal, pullMemoryFromServer, syncMemoryToServer, rememberLandmarkLocal } from "./utils/worldMemory";
 import { designAiHouse } from "./utils/aiHouseArchitect";
 import { 
   PlayerState, 
@@ -124,6 +126,16 @@ export default function App() {
   };
 
   // Live synchronization: pull real server configuration on mount without requiring reboot
+  // PERSISTENT MEMORY: on boot, pull the authoritative world memory from the server into
+  // the local mirror, then push local updates back every 60s so learning survives reloads.
+  useEffect(() => {
+    pullMemoryFromServer().catch(() => {});
+    const t = setInterval(() => { syncMemoryToServer().catch(() => {}); }, 60000);
+    const onHide = () => { syncMemoryToServer().catch(() => {}); };
+    window.addEventListener("beforeunload", onHide);
+    return () => { clearInterval(t); window.removeEventListener("beforeunload", onHide); };
+  }, []);
+
   useEffect(() => {
     let isMounted = true;
     fetchServerEnvConfig()
@@ -2216,6 +2228,19 @@ export default function App() {
       const executionFeedback = feedbackEngine.generatePromptFeedbackString();
       const detectedMistakes = feedbackEngine.getMistakes();
 
+      // PERSISTENT MEMORY: journal this goal and learn from the live scan as we go.
+      try {
+        recordJournalLocal("goal", goal.slice(0, 140), [Math.round(player.x || 0), Math.round(player.y || 0), Math.round(player.z || 0)]);
+        const memScan = (player as any)?.cubeMap?.voxels || (player as any)?.nearbyBlocks;
+        if (Array.isArray(memScan)) {
+          for (const v of memScan) {
+            if (v && v.name && !["air", "grass", "dirt", "stone", "cobblestone"].includes(String(v.name).replace("minecraft:", ""))) {
+              noteResourceSightingLocal(v.name, Number(v.x) || 0, Number(v.y) || 0, Number(v.z) || 0);
+            }
+          }
+        }
+      } catch {}
+
       // Generate surrounding 3D Block Cube Map — LIVE world blocks when the Fabric bridge is
       // connected (real coordinates, real block identities), procedural only as offline fallback.
       // Fresh live position: refresh telemetry from the bridge right before every scan so
@@ -2600,6 +2625,20 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
           });
         }
       }
+
+      // PERSISTENT MEMORY: consume 'remember_landmark' actions locally (mirror to server on next sync).
+      safeActions = safeActions.filter((a: any) => {
+        const t = String(a.type || (a as any).action || "").toLowerCase();
+        if (t === "remember_landmark" || t === "save_landmark" || t === "waypoint") {
+          const x = Number(a.x ?? a.pos?.[0]), y = Number(a.y ?? a.pos?.[1]), z = Number(a.z ?? a.pos?.[2]);
+          if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+            rememberLandmarkLocal(String(a.name || a.label || "waypoint"), x, y, z, String(a.description || a.desc || ""));
+            syncMemoryToServer().catch(() => {});
+          }
+          return false;
+        }
+        return true;
+      });
 
       // Sequentially dispatch actions with smart aiming lock settling
       for (let i = 0; i < safeActions.length; i++) {

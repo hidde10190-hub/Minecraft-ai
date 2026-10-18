@@ -400,6 +400,21 @@ class MinecraftAiOrchestrator:
 
             # Standard LLM cognitive cycle
             memory_summary = self.memory.get_short_term_summary(max_items=5)
+            # PERSISTENT MEMORY: append long-term spatial recall so every provider tier
+            # knows where landmarks/resources were seen in previous sessions.
+            try:
+                pl = (self.latest_telemetry or {}).get("player", {}) or {}
+                lt = self.memory.build_long_term_briefing(pl.get("x", 0), pl.get("y", 0), pl.get("z", 0))
+                memory_summary = f"{memory_summary}\n--- LONG-TERM MEMORY ---\n{lt}"
+                # Learn from voxel scan (bridge cube map) into persistent resource memory.
+                voxels = ((self.latest_telemetry or {}).get("cubeMap") or {}).get("voxels", [])
+                common = {"air", "stone", "cobblestone", "dirt", "grass", "grass_block", "deepslate", "gravel", "sand", "water"}
+                for v in voxels[:200]:
+                    nm = str(v.get("name", "")).replace("minecraft:", "").lower()
+                    if nm and nm not in common:
+                        self.memory.note_resource_sighting(nm, v.get("x", 0), v.get("y", 0), v.get("z", 0))
+            except Exception as mem_exc:
+                print(f"[Orchestrator] Memory enrichment skipped: {mem_exc}")
             try:
                 plan = await self.model.generate_action_plan(
                     self.latest_telemetry,

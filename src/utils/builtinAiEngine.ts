@@ -9,6 +9,7 @@ import {
   BlockCubeMap
 } from "../types";
 import { blockNamesCompatible, isPlaceableBlockItem } from "./blockMatch";
+import { buildMemoryBriefingLocal, noteResourceSightingLocal } from "./worldMemory";
 
 export interface BuiltinPlanResult {
   thought: string;
@@ -57,6 +58,19 @@ export function solveBuiltinTacticalPlan(
   rulesEvaluated++;
 
   let thought = `[Built-in Tactical AI: ${agentName} (${agentRole})] `;
+
+  // PERSISTENT MEMORY: learn from this scan (ores/logs remembered across sessions).
+  try {
+    if (Array.isArray((cubeMap as any)?.voxels)) {
+      for (const v of (cubeMap as any).voxels) {
+        const clean = String(v?.name || "").replace("minecraft:", "").toLowerCase();
+        if (clean && !["air", "stone", "cobblestone", "dirt", "grass", "grass_block", "deepslate", "gravel", "sand", "water"].includes(clean)) {
+          noteResourceSightingLocal(clean, Number(v.x) || 0, Number(v.y) || 0, Number(v.z) || 0);
+        }
+      }
+    }
+  } catch {}
+
 
   // 3. Priority Rule: Hostile Threat Reaction (if Guard or Assistant, or explicitly requested)
   const nearbyHostiles = entities.filter((e) => 

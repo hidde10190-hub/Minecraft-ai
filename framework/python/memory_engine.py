@@ -82,6 +82,46 @@ class MemoryEngine:
         })
         self.persist()
 
+    def note_resource_sighting(self, block_name: str, x: float, y: float, z: float):
+        """Remembers where a valuable block was last seen (persistent across restarts)."""
+        clean = str(block_name or "").replace("minecraft:", "").lower().strip()
+        if not clean:
+            return
+        prev = self.long_term_data.setdefault("resource_sightings", {}).get(clean, {})
+        self.long_term_data["resource_sightings"][clean] = {
+            "count": int(prev.get("count", 0)) + 1,
+            "lastX": round(float(x), 1),
+            "lastY": round(float(y), 1),
+            "lastZ": round(float(z), 1),
+            "lastSeen": time.time(),
+        }
+        self.persist()
+
+    def build_long_term_briefing(self, px: float = 0, py: float = 0, pz: float = 0) -> str:
+        """Distance-aware recall of landmarks and known resources for LLM prompts."""
+        lines: List[str] = []
+        landmarks = self.long_term_data.get("landmarks", {})
+        if landmarks:
+            lines.append("KNOWN LANDMARKS (persistent memory):")
+            for name, lm in list(landmarks.items())[-10:]:
+                d = ((lm.get("x", 0) - px) ** 2 + (lm.get("y", 0) - py) ** 2 + (lm.get("z", 0) - pz) ** 2) ** 0.5
+                desc = f" - {lm['description']}" if lm.get("description") else ""
+                lines.append(f"- {name}: [{lm.get('x')}, {lm.get('y')}, {lm.get('z')}] ({d:.0f}m away){desc}")
+        sightings = self.long_term_data.get("resource_sightings", {})
+        if sightings:
+            lines.append("KNOWN RESOURCES (last observed position):")
+            for name, r in list(sightings.items())[-12:]:
+                d = ((r.get("lastX", 0) - px) ** 2 + (r.get("lastY", 0) - py) ** 2 + (r.get("lastZ", 0) - pz) ** 2) ** 0.5
+                lines.append(f"- {name}: last seen at [{r.get('lastX')}, {r.get('lastY')}, {r.get('lastZ')}] ({d:.0f}m away, sightings: {r.get('count', 1)})")
+        notes = self.long_term_data.get("task_notes", [])
+        if notes:
+            lines.append("TASK NOTES:")
+            for n in notes[-4:]:
+                lines.append(f"- {n.get('note')}")
+        if not lines:
+            return "(No persistent memories yet. Store landmarks with save_landmark actions.)"
+        return "\n".join(lines)
+
     def load_long_term_memory(self):
         if os.path.exists(self.storage_path):
             try:

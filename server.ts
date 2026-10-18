@@ -758,6 +758,173 @@ app.post("/api/ollama/test", async (req, res) => {
 const SKILLS_FILE_PATH = path.resolve(process.cwd(), "data", "skills.json");
 const FAILURES_FILE_PATH = path.resolve(process.cwd(), "data", "failures.json");
 
+// ==============================================================================
+// PERSISTENT WORLD MEMORY ENGINE (authoritative server copy: data/world_memory.json)
+// Spatial landmarks, known resource locations, completed projects, standing
+// lessons and a rolling journal. Survives restarts so the bot becomes MORE
+// aware of the world over time instead of re-learning every session.
+// ==============================================================================
+const WORLD_MEMORY_FILE_PATH = path.resolve(process.cwd(), "data", "world_memory.json");
+
+export interface WorldMemoryData {
+  landmarks: Record<string, { x: number; y: number; z: number; dimension?: string; description?: string; createdAt: string; updatedAt: string }>;
+  knownResources: Record<string, { count: number; lastX: number; lastY: number; lastZ: number; lastSeen: string; dimension?: string }>;
+  completedProjects: Array<{ name: string; schematic?: string; center: [number, number, number]; blocksPlaced: number; finishedAt: string }>;
+  failureLessons: Array<{ lesson: string; context: string; recordedAt: string }>;
+  journal: Array<{ ts: string; event: string; detail: string; pos?: [number, number, number] }>;
+}
+
+const DEFAULT_WORLD_MEMORY: WorldMemoryData = {
+  landmarks: {},
+  knownResources: {},
+  completedProjects: [],
+  failureLessons: [],
+  journal: []
+};
+
+let worldMemoryCache: WorldMemoryData | null = null;
+let worldMemorySaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function loadWorldMemory(): WorldMemoryData {
+  if (worldMemoryCache) return worldMemoryCache;
+  try {
+    if (fs.existsSync(WORLD_MEMORY_FILE_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(WORLD_MEMORY_FILE_PATH, "utf-8"));
+      worldMemoryCache = {
+        ...DEFAULT_WORLD_MEMORY,
+        ...parsed,
+        landmarks: parsed.landmarks || {},
+        knownResources: parsed.knownResources || {},
+        completedProjects: Array.isArray(parsed.completedProjects) ? parsed.completedProjects : [],
+        failureLessons: Array.isArray(parsed.failureLessons) ? parsed.failureLessons : [],
+        journal: Array.isArray(parsed.journal) ? parsed.journal : []
+      };
+      return worldMemoryCache;
+    }
+  } catch (e) {
+    console.error("Error reading world_memory.json:", e);
+  }
+  worldMemoryCache = JSON.parse(JSON.stringify(DEFAULT_WORLD_MEMORY));
+  return worldMemoryCache;
+}
+
+export function saveWorldMemoryNow(): void {
+  if (!worldMemoryCache) return;
+  try {
+    const tmp = WORLD_MEMORY_FILE_PATH + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(worldMemoryCache, null, 2), "utf-8");
+    fs.renameSync(tmp, WORLD_MEMORY_FILE_PATH);
+  } catch (e) {
+    console.error("Error saving world_memory.json:", e);
+  }
+}
+
+export function persistWorldMemory(): void {
+  if (worldMemorySaveTimer) clearTimeout(worldMemorySaveTimer);
+  worldMemorySaveTimer = setTimeout(() => { worldMemorySaveTimer = null; saveWorldMemoryNow(); }, 1500);
+  if (worldMemorySaveTimer && typeof (worldMemorySaveTimer as any).unref === "function") (worldMemorySaveTimer as any).unref();
+}
+
+export function recordWorldEvent(event: string, detail: string, pos?: [number, number, number]): void {
+  const mem = loadWorldMemory();
+  mem.journal.push({ ts: new Date().toISOString(), event, detail, pos });
+  if (mem.journal.length > 300) mem.journal.splice(0, mem.journal.length - 300);
+  persistWorldMemory();
+}
+
+export function rememberLandmark(name: string, x: number, y: number, z: number, description = "", dimension?: string): void {
+  const mem = loadWorldMemory();
+  const key = String(name || "").toLowerCase().replace(/[^a-z0-9_]+/g, "_").slice(0, 48) || "unnamed";
+  const now = new Date().toISOString();
+  mem.landmarks[key] = {
+    x: Math.round(x * 10) / 10, y: Math.round(y * 10) / 10, z: Math.round(z * 10) / 10,
+    dimension, description,
+    createdAt: mem.landmarks[key]?.createdAt || now, updatedAt: now
+  };
+  recordWorldEvent("landmark", `${key} @ [${Math.round(x)}, ${Math.round(y)}, ${Math.round(z)}] ${description}`.trim(), [x, y, z]);
+}
+
+const INTERESTING_BLOCKS = ["diamond_ore", "deepslate_diamond_ore", "emerald_ore", "deepslate_emerald_ore", "gold_ore", "deepslate_gold_ore", "iron_ore", "deepslate_iron_ore", "copper_ore", "deepslate_copper_ore", "coal_ore", "deepslate_coal_ore", "redstone_ore", "deepslate_redstone_ore", "lapis_ore", "deepslate_lapis_ore", "ancient_debris", "oak_log", "birch_log", "spruce_log", "jungle_log", "acacia_log", "dark_oak_log", "mangrove_log", "cherry_log", "netherite_block", "beacon", "spawner", "chest", "ender_chest", "crafting_table", "furnace"];
+
+export function observeVoxelsIntoMemory(voxels: any[], dimension?: string): void {
+  if (!Array.isArray(voxels) || voxels.length === 0) return;
+  const mem = loadWorldMemory();
+  let changed = false;
+  for (const v of voxels) {
+    if (!v || !v.name) continue;
+    const clean = String(v.name).replace("minecraft:", "").toLowerCase();
+    if (!INTERESTING_BLOCKS.includes(clean)) continue;
+    const prev = mem.knownResources[clean];
+    mem.knownResources[clean] = {
+      count: (prev?.count || 0) + 1,
+      lastX: Math.round(Number(v.x) || 0),
+      lastY: Math.round(Number(v.y) || 0),
+      lastZ: Math.round(Number(v.z) || 0),
+      lastSeen: new Date().toISOString(),
+      dimension
+    };
+    changed = true;
+  }
+  if (changed) persistWorldMemory();
+}
+
+export function noteProjectDone(name: string, center: [number, number, number], blocksPlaced: number, schematic?: string): void {
+  const mem = loadWorldMemory();
+  if (!mem.completedProjects.some((p) => p.name === name && p.center.join(",") === center.join(","))) {
+    mem.completedProjects.push({ name, center, blocksPlaced, schematic, finishedAt: new Date().toISOString() });
+    if (mem.completedProjects.length > 50) mem.completedProjects.splice(0, mem.completedProjects.length - 50);
+    recordWorldEvent("project_done", `${name}: ${blocksPlaced} blocks @ [${center.map(Math.round).join(", ")}]`, center);
+  }
+}
+
+export function noteFailureLesson(lesson: string, context: string): void {
+  const mem = loadWorldMemory();
+  if (!mem.failureLessons.some((l) => l.lesson === lesson)) {
+    mem.failureLessons.push({ lesson, context, recordedAt: new Date().toISOString() });
+    if (mem.failureLessons.length > 60) mem.failureLessons.splice(0, mem.failureLessons.length - 60);
+    persistWorldMemory();
+  }
+}
+
+export function buildMemoryBriefing(playerPos: { x?: number; y?: number; z?: number }): string {
+  const mem = loadWorldMemory();
+  const lines: string[] = [];
+  const px = playerPos?.x ?? 0, py = playerPos?.y ?? 0, pz = playerPos?.z ?? 0;
+  const dist = (p: any) => Math.hypot((p.lastX ?? p.x ?? 0) - px, (p.lastY ?? p.y ?? 0) - py, (p.lastZ ?? p.z ?? 0) - pz).toFixed(0);
+
+  const landmarkKeys = Object.keys(mem.landmarks);
+  if (landmarkKeys.length > 0) {
+    lines.push("KNOWN LANDMARKS (remembered across sessions):");
+    landmarkKeys.slice(-10).forEach((k) => {
+      const l = mem.landmarks[k];
+      lines.push(`- ${k}: [${l.x}, ${l.y}, ${l.z}] (${dist(l)}m away)${l.description ? " - " + l.description : ""}`);
+    });
+  }
+  const resourceKeys = Object.keys(mem.knownResources);
+  if (resourceKeys.length > 0) {
+    lines.push("KNOWN RESOURCES (last observed location, may still be there):");
+    resourceKeys.slice(-12).forEach((k) => {
+      const r = mem.knownResources[k];
+      lines.push(`- ${k}: last seen at [${r.lastX}, ${r.lastY}, ${r.lastZ}] (${dist(r)}m away, sightings: ${r.count})`);
+    });
+  }
+  if (mem.completedProjects.length > 0) {
+    lines.push("PROJECTS YOU BUILT (do NOT rebuild these, extend or repair only if asked):");
+    mem.completedProjects.slice(-5).forEach((p) => lines.push(`- ${p.name}${p.center ? ` @ [${p.center.join(", ")}]` : ""} (${p.blocksPlaced} blocks)`));
+  }
+  if (mem.failureLessons.length > 0) {
+    lines.push("STANDING LESSONS FROM THE PAST:");
+    mem.failureLessons.slice(-6).forEach((f) => lines.push(`- ${f.lesson} (${f.context})`));
+  }
+  const recent = mem.journal.slice(-5);
+  if (recent.length > 0) {
+    lines.push("RECENT JOURNAL:");
+    recent.forEach((j) => lines.push(`- [${j.ts.slice(11, 16)}] ${j.event}: ${j.detail}`));
+  }
+  if (lines.length === 0) return "(No persistent memories yet. Everything you learn this session will be stored and recalled in future sessions.)";
+  return lines.join("\n");
+}
+
 // Ensure /data directory exists
 if (!fs.existsSync(path.resolve(process.cwd(), "data"))) {
   try { fs.mkdirSync(path.resolve(process.cwd(), "data"), { recursive: true }); } catch {}
@@ -1140,6 +1307,65 @@ app.post("/api/ai/failures", (req, res) => {
 app.post("/api/ai/failures/clear", (req, res) => {
   saveFailuresToFile([]);
   res.json({ success: true, message: "Failures cleared." });
+});
+
+app.get("/api/ai/memory", (req, res) => {
+  res.json({ success: true, memory: loadWorldMemory() });
+});
+
+app.post("/api/ai/memory/landmark", (req, res) => {
+  const { name, x, y, z, description } = req.body || {};
+  if (!name || typeof x !== "number" || typeof y !== "number" || typeof z !== "number") {
+    return res.status(400).json({ success: false, message: "name,x,y,z required" });
+  }
+  rememberLandmark(String(name), x, y, z, String(description || ""));
+  saveWorldMemoryNow();
+  res.json({ success: true, memory: loadWorldMemory() });
+});
+
+// Client mirror sync: merges incoming localStorage snapshot into server truth (newer wins per-key)
+app.post("/api/ai/memory/sync", (req, res) => {
+  try {
+    const incoming = req.body || {};
+    const mem = loadWorldMemory();
+    const inLandmarks = incoming.landmarks || {};
+    for (const [k, v] of Object.entries<any>(inLandmarks)) {
+      const cur = mem.landmarks[k];
+      if (!cur || new Date(v.updatedAt || 0) >= new Date(cur.updatedAt || 0)) mem.landmarks[k] = v;
+    }
+    const inRes = incoming.knownResources || {};
+    for (const [k, v] of Object.entries<any>(inRes)) {
+      const cur = mem.knownResources[k];
+      if (!cur || new Date(v.lastSeen || 0) >= new Date(cur.lastSeen || 0)) mem.knownResources[k] = v;
+    }
+    for (const p of Array.isArray(incoming.completedProjects) ? incoming.completedProjects : []) {
+      if (!mem.completedProjects.some((mp) => mp.name === p.name && (mp.center || []).join(",") === (p.center || []).join(","))) {
+        mem.completedProjects.push(p);
+      }
+    }
+    for (const l of Array.isArray(incoming.failureLessons) ? incoming.failureLessons : []) {
+      if (!mem.failureLessons.some((ml) => ml.lesson === l.lesson)) mem.failureLessons.push(l);
+    }
+    if (Array.isArray(incoming.journal)) {
+      const seen = new Set(mem.journal.map((j) => `${j.ts}|${j.event}|${j.detail}`));
+      for (const j of incoming.journal) {
+        const key = `${j.ts}|${j.event}|${j.detail}`;
+        if (!seen.has(key)) mem.journal.push(j);
+      }
+      mem.journal.sort((a, b) => new Date(a.ts).getTime() - new Date(b.ts).getTime());
+      if (mem.journal.length > 300) mem.journal.splice(0, mem.journal.length - 300);
+    }
+    saveWorldMemoryNow();
+    res.json({ success: true, memory: mem });
+  } catch (e: any) {
+    res.status(500).json({ success: false, message: e?.message || String(e) });
+  }
+});
+
+app.delete("/api/ai/memory", (req, res) => {
+  worldMemoryCache = JSON.parse(JSON.stringify(DEFAULT_WORLD_MEMORY));
+  saveWorldMemoryNow();
+  res.json({ success: true, message: "Persistent world memory wiped." });
 });
 
 app.post("/api/ai/reflect", async (req, res) => {
@@ -2661,6 +2887,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
   const currentSkills = loadSkillsFromFile();
   const recentFailures = loadFailuresFromFile().slice(0, 5);
   const skillsContext = currentSkills.map(s => `- [${s.category.toUpperCase()}] ${s.name}: ${s.rule} (Min hold: ${s.requiredDurationMs}ms with ${s.tool || "any"})`).join("\n");
+  const memoryBriefing = buildMemoryBriefing(player);
   const failuresContext = recentFailures.length > 0
     ? recentFailures.map(f => `- ⚠️ Failed on ${f.target}: ${f.reason} -> Learned Fix: ${f.correctionAdvice}`).join("\n")
     : "- No recent failures recorded. You have a clean track record.";
@@ -2750,6 +2977,13 @@ ${skillsContext}
 RECENT FAILURES & LESSONS (FROM failures.json):
 ${failuresContext}
 
+PERSISTENT WORLD MEMORY (your long-term spatial memory, survives restarts):
+${memoryBriefing}
+- Use KNOWN RESOURCES to plan where to walk when a resource is not in your current scan range (e.g. 'walk toward remembered diamond vein').
+- Use KNOWN LANDMARKS to navigate home/follow waypoints instead of wandering randomly.
+- Respect PROJECTS YOU BUILT: never rebuild an existing structure; extend or repair only if explicitly asked.
+- You may emit {"type":"remember_landmark","name":"base","x":..,"y":..,"z":..,"description":"..."} to store a new waypoint permanently.
+
 =============================================================================
 5. CONVERSATION & CHAT RULES (CRITICAL - MOST DIRECTIVES ARE CHAT REPLIES):
 =============================================================================
@@ -2815,6 +3049,10 @@ STRICT JSON OUTPUT FORMAT:
   // Build a DETERMINISTIC, coordinate-accurate spatial block manifest from the raw voxel map.
   // Every provider tier (NVIDIA, Gemini, Ollama, Built-in) receives this identical ground-truth list,
   // so no model ever has to guess which symbol in an ASCII matrix maps to which block/coordinate.
+  // PERSISTENT MEMORY: feed the live scan into long-term world memory so the bot
+  // remembers where valuable resources were seen across sessions.
+  try { observeVoxelsIntoMemory(cubeMap?.voxels || [], req.body?.dimension); } catch {}
+
   let cubeContextText = "";
   if (Array.isArray(cubeMap?.voxels) && cubeMap.voxels.length > 0) {
     const vox = cubeMap.voxels;
@@ -3854,6 +4092,20 @@ function postProcessPlanWithLearning(result: any, req: any): any {
       failureAlerts.push(check.message);
     }
   }
+
+  // PERSISTENT MEMORY: consume 'remember_landmark' actions emitted by any provider.
+  result.actions = (result.actions || []).filter((a: any) => {
+    const t = String(a?.type || "").toLowerCase();
+    if (t === "remember_landmark" || t === "save_landmark" || t === "waypoint") {
+      const x = Number(a.x ?? a.pos?.[0]), y = Number(a.y ?? a.pos?.[1]), z = Number(a.z ?? a.pos?.[2]);
+      if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+        rememberLandmark(String(a.name || a.label || "waypoint"), x, y, z, String(a.description || a.desc || ""));
+        saveWorldMemoryNow();
+      }
+      return false; // consumed by server, not forwarded to the game bridge
+    }
+    return true;
+  });
 
   // Remove placements flagged as unsafe (air/tool in hand with no block material available)
   result.actions = result.actions.filter((a: any) => !a.__drop);
