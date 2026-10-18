@@ -1,0 +1,6 @@
+{
+  "name": "Minecraft AI Controller Framework",
+  "description": "Autonomous Minecraft 26.2 AI Controller Framework (Minecraft-AI-Bridge) featuring competitive 1.9+ PvP combat, slap retaliation revanche engine, multi-agent swarm orchestration, live in-game chat perception, Fabric Java 25 mod, and Litematica integration.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
