@@ -772,6 +772,8 @@ export interface WorldMemoryData {
   completedProjects: Array<{ name: string; schematic?: string; center: [number, number, number]; blocksPlaced: number; finishedAt: string }>;
   failureLessons: Array<{ lesson: string; context: string; recordedAt: string }>;
   journal: Array<{ ts: string; event: string; detail: string; pos?: [number, number, number] }>;
+  // Danger zones (deep water / drowning spots / lava) remembered across sessions.
+  hazards: Array<{ kind: "drowning" | "lava" | "fall" | "mob" | "other"; x: number; y: number; z: number; radius: number; description?: string; lastSeen: string }>;
 }
 
 const DEFAULT_WORLD_MEMORY: WorldMemoryData = {
@@ -779,7 +781,8 @@ const DEFAULT_WORLD_MEMORY: WorldMemoryData = {
   knownResources: {},
   completedProjects: [],
   failureLessons: [],
-  journal: []
+  journal: [],
+  hazards: []
 };
 
 let worldMemoryCache: WorldMemoryData | null = null;
@@ -797,7 +800,8 @@ export function loadWorldMemory(): WorldMemoryData {
         knownResources: parsed.knownResources || {},
         completedProjects: Array.isArray(parsed.completedProjects) ? parsed.completedProjects : [],
         failureLessons: Array.isArray(parsed.failureLessons) ? parsed.failureLessons : [],
-        journal: Array.isArray(parsed.journal) ? parsed.journal : []
+        journal: Array.isArray(parsed.journal) ? parsed.journal : [],
+        hazards: Array.isArray(parsed.hazards) ? parsed.hazards : []
       };
       return worldMemoryCache;
     }
@@ -886,6 +890,26 @@ export function noteFailureLesson(lesson: string, context: string): void {
   }
 }
 
+const HAZARD_CAP = 40;
+
+/** Server-side hazard recording (mirrors client noteHazardLocal). */
+export function noteServerHazard(kind: string, x: number, y: number, z: number, radius = 8, description = ""): void {
+  const mem = loadWorldMemory();
+  const now = new Date().toISOString();
+  const k = ["drowning", "lava", "fall", "mob", "other"].includes(kind) ? (kind as any) : "other";
+  const existing = mem.hazards.find((h) => h.kind === k && Math.hypot(h.x - x, h.y - y, h.z - z) <= 4);
+  if (existing) {
+    const far = Math.hypot(existing.x - x, existing.y - y, existing.z - z);
+    existing.radius = Math.max(existing.radius, radius, Math.ceil(far + radius));
+    existing.lastSeen = now;
+    if (description) existing.description = description;
+  } else {
+    mem.hazards.push({ kind: k, x: Math.round(x), y: Math.round(y), z: Math.round(z), radius, description, lastSeen: now });
+    if (mem.hazards.length > HAZARD_CAP) mem.hazards.splice(0, mem.hazards.length - HAZARD_CAP);
+  }
+  recordWorldEvent("hazard", `${k} hazard @ [${Math.round(x)}, ${Math.round(y)}, ${Math.round(z)}] r=${radius} ${description}`.trim(), [x, y, z]);
+}
+
 export function buildMemoryBriefing(playerPos: { x?: number; y?: number; z?: number }): string {
   const mem = loadWorldMemory();
   const lines: string[] = [];
@@ -915,6 +939,14 @@ export function buildMemoryBriefing(playerPos: { x?: number; y?: number; z?: num
   if (mem.failureLessons.length > 0) {
     lines.push("STANDING LESSONS FROM THE PAST:");
     mem.failureLessons.slice(-6).forEach((f) => lines.push(`- ${f.lesson} (${f.context})`));
+  }
+  if (Array.isArray(mem.hazards) && mem.hazards.length > 0) {
+    lines.push("KNOWN HAZARD ZONES (avoid or mitigate before building/lingering):");
+    mem.hazards.slice(-8).forEach((h) => {
+      const d = Math.hypot(h.x - px, h.y - py, h.z - pz).toFixed(0);
+      lines.push(`- [${h.kind}] @ [${h.x}, ${h.y}, ${h.z}] radius ${h.radius}m (${d}m away)${h.description ? " - " + h.description : ""}`);
+    });
+    lines.push("RULE: never linger submerged with low air; if a build site is inside a hazard zone, build a dry platform/pillar first or route around it.");
   }
   const recent = mem.journal.slice(-5);
   if (recent.length > 0) {

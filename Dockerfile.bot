@@ -1,0 +1,35 @@
+# Bot container: virtual X display + noVNC so the swarm is visible in the browser.
+FROM node:20-bookworm
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Xvfb (virtual display), x11vnc (exposes it as VNC), websockify+novnc (VNC->WebSocket->browser)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      xvfb x11vnc novnc websockify supervisor xterm \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /bot
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build:bot || true
+
+# Supervisor config: Xvfb on :1, x11vnc on :5900, websockify/noVNC on :6080, bot process
+RUN printf '[program:xvfb]\n\
+command=Xvfb :1 -screen 0 1280x720x24\n\
+autorestart=true\n\
+[program:x11vnc]\n\
+command=x11vnc -display :1 -forever -shared -rfbport 5900 -nopw\n\
+autorestart=true\n\
+startsecs=3\n\
+[program:novnc]\n\
+command=websockify --web=/usr/share/novnc/ 6080 localhost:5900\n\
+autorestart=true\n\
+startsecs=3\n\
+[program:bot]\n\
+command=node dist/bot/index.js\n\
+environment=DISPLAY=":1"\n\
+autorestart=true\n\
+
+EXPOSE 6080 5900
+CMD ["supervisord", "-n"]
