@@ -1,2 +1,14 @@
 node_modules/
 dist/
+
+# Build- en Gradle-output (bevat o.a. de Minecraft-jar, 2x36 MB)
+framework/.gradle/
+framework/build/
+framework/run/
+*.class
+*.jar
+*.jar.backup
+!framework/gradle/wrapper/gradle-wrapper.jar
+
+# Lokale secrets (de dashboard schrijft API-keys naar .env en config.env)
+.env
