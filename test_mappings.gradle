@@ -1,0 +1,10 @@
+plugins {
+    id 'fabric-loom' version '1.17.20'
+}
+minecraft {
+    version = '26.2'
+}
+dependencies {
+    minecraft "com.mojang:minecraft:26.2"
+    mappings "net.fabricmc:intermediary:26.2@jar"
+}
