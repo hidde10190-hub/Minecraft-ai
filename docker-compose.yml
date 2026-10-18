@@ -38,6 +38,10 @@ services:
       # with "Multiple garbage collectors selected" when both are present. The client's
       # build.gradle already passes -Xms/-Xmx/GC flags itself, so this env var only
       # needs to cap the Gradle daemon's heap.
+      # Software-OpenGL (Mesa llvmpipe) voor het virtuele scherm: er is geen GPU in de container.
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - MESA_GL_VERSION_OVERRIDE=4.5
+      - MESA_GLSL_VERSION_OVERRIDE=450
       - JAVA_TOOL_OPTIONS=-Xmx4G -Xms512M -Dfabric.gui.disable=true -XX:+PerfDisableSharedMem
     # Resources: sized for a smooth client. NOTE: on Docker Desktop (Windows/Mac) these
     # limits only help if the WSL2/VM total allocation in Docker Settings is raised too
@@ -96,7 +100,7 @@ services:
                find /root/.gradle/caches/fabric-loom -name '*.lock' -delete 2>/dev/null; find /app/framework/.gradle -name '*.lock' -delete 2>/dev/null;
                rm -rf /app/framework/build/tmp/compileJava 2>/dev/null;
                rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true &&
-               Xvfb :99 -screen 0 1024x768x16 &
+               Xvfb :99 -screen 0 1280x720x24 +extension GLX +render -noreset &
                export DISPLAY=:99 &&
                sleep 2 &&
                (x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>/dev/null || true) &&

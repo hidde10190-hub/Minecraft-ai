@@ -44,4 +44,4 @@ ENV JAVA_TOOL_OPTIONS="-Dfabric.gui.disable=true"
 EXPOSE 8080
 EXPOSE 6080
 
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1024x768x16 & export DISPLAY=:99 && sleep 2 && (x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>/dev/null || true) && (websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &) ; cd /app/framework && ./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=${MINECRAFT_SERVER} -Dminecraft.ai.botname=${BOT_NAME} --no-daemon"]
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x720x24 +extension GLX +render -noreset & export DISPLAY=:99 && sleep 2 && (x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>/dev/null || true) && (websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &) ; cd /app/framework && ./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=${MINECRAFT_SERVER} -Dminecraft.ai.botname=${BOT_NAME} --no-daemon"]
