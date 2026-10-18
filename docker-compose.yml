@@ -148,3 +148,4 @@ services:
 
 volumes:
   mc-data:
+  gradle_cache:
