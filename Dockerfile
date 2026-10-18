@@ -1,4 +1,4 @@
-# Multi-stage Dockerfile for Standalone Minecraft 26.2 AI Controller + Java 25 Runtime
+# Multi-stage Dockerfile for Standalone Minecraft 26.3 AI Controller + Java 25 Runtime
 FROM eclipse-temurin:25-jdk-noble AS builder
 
 WORKDIR /app

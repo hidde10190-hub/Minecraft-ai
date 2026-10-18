@@ -47,7 +47,7 @@ configurations.configureEach {
 dependencies {
     // Minecraft & Fabric Environment
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
-    // Mappings are not required for Minecraft 26.2+ as the jar is already unobfuscated.
+    // Mappings are not required for Minecraft 26.x as the jar is already unobfuscated.
     // Removing loom.officialMojangMappings() to fix "Cannot use Mojang mappings in a non-obfuscated environment" error.
 
     implementation "net.fabricmc:fabric-loader:${project.loader_version}"
@@ -62,16 +62,16 @@ dependencies {
     include "com.google.code.gson:gson:2.10.1"
 
     // Performance Optimization Stack
-    implementation("maven.modrinth:AANobbMI:2Yom1N68") // Sodium 0.9.1 for 26.2
-    implementation("maven.modrinth:gvQqBUqZ:x1OEDMlF") // Lithium 0.25.0 for 26.2
+    implementation("maven.modrinth:AANobbMI:g6ju16VJ") // Sodium 0.9.3-beta.1 for 26.3
+    implementation("maven.modrinth:gvQqBUqZ:xS0Q8LSi") // Lithium 0.26.2 for 26.3
 
     // Simple Voice Chat API
-    implementation("maven.modrinth:9eGKb6K1:XOyGNG2m") // Simple Voice Chat 2.6.18 for 26.2
+    implementation("maven.modrinth:9eGKb6K1:OLnMVWXy") // Simple Voice Chat 2.6.24 for 26.3
     
     // Litematica, MaLiLib & Syncmatica Integration
-    implementation("maven.modrinth:GcWjdA9I:KvjmGjAV") // MaLiLib 26.2-0.29.6
-    implementation("maven.modrinth:bEpr0Arc:CuniXtbo") // Litematica 0.28.8 for 26.2
-    implementation("maven.modrinth:bfneejKo:POv0nHxV") // Syncmatica 0.3.20 for 26.2
+    implementation("maven.modrinth:GcWjdA9I:JX9bESec") // MaLiLib 0.30.2 for 26.3
+    implementation("maven.modrinth:bEpr0Arc:ZqV316KY") // Litematica 0.29.1 for 26.3
+    implementation("maven.modrinth:bfneejKo:uT7TJ2Wp") // Syncmatica 0.3.20 for 26.3
 }
 
 loom {

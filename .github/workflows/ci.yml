@@ -24,3 +24,25 @@ jobs:
         run: npm run build
       - name: Dependency audit (high and above)
         run: npm audit --audit-level=high
+
+  mod:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: framework
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            framework/.gradle/loom-cache
+          key: gradle-${{ runner.os }}-${{ hashFiles('framework/build.gradle', 'framework/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+      - name: Build Fabric mod (Minecraft 26.3)
+        run: chmod +x gradlew && ./gradlew build --no-daemon --console=plain
