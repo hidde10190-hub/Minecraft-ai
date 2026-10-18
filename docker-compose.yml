@@ -25,6 +25,8 @@ services:
     ports:
       - "8080:8080"
       - "8079:8080"
+      # noVNC web stream of the bot's virtual screen (Xvfb :99 -> x11vnc :5900 -> websockify :6080)
+      - "6080:6080"
     environment:
       - MINECRAFT_SERVER=${MINECRAFT_SERVER:-host.docker.internal:25565}
       - BOT_NAME=${BOT_NAME:-${MINECRAFT_BOT_USERNAME:-Gemini}}
@@ -81,7 +83,7 @@ services:
     cap_add:
       - SYS_MODULE
     command: >
-      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils gcc libc6-dev > /dev/null 2>&1 || true &&
+      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb x11vnc libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils gcc libc6-dev node-novnc websockify > /dev/null 2>&1 || true &&
                printf '#include <fcntl.h>\n#include <unistd.h>\n#include <sys/ioctl.h>\n#include <linux/uinput.h>\nint main(){int fd=open(\"/dev/uinput\",O_WRONLY);if(fd<0)return 1;return ioctl(fd,UI_DEV_CREATE,0)==0?0:2;}\n' > /tmp/ui.c && (gcc -o /usr/local/bin/uinput-create /tmp/ui.c 2>/dev/null || true) &&
                mkdir -p /app/framework/run/config &&
                (modprobe uinput 2>/dev/null || true) &&
@@ -93,6 +95,9 @@ services:
                rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true &&
                Xvfb :99 -screen 0 1024x768x16 &
                export DISPLAY=:99 &&
+               sleep 2 &&
+               (x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>/dev/null || true) &&
+               (websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &) || true &&
                export MINECRAFT_SERVER_HOST=\"$$MINECRAFT_SERVER\" &&
                export MINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" &&
                echo '=====================================================' &&
