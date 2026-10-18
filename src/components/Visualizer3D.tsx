@@ -1,6 +1,6 @@
 import React, { useRef, useEffect, useState } from "react";
 import { PlayerState, RaycastTarget, SchematicDiffItem, EntityState, AgentInstance, TemporaryScaffoldBlock } from "../types";
-import { Eye, Compass, Box, RefreshCw, ZoomIn, ZoomOut, RotateCcw, Users } from "lucide-react";
+import { Eye, Compass, Box, RefreshCw, ZoomIn, ZoomOut, RotateCcw, Users, MonitorPlay, ExternalLink } from "lucide-react";
 
 interface Visualizer3DProps {
   player: PlayerState;
@@ -32,6 +32,26 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
   const [isDragging, setIsDragging] = useState(false);
   const [lastMouse, setLastMouse] = useState({ x: 0, y: 0 });
   const [cameraMode, setCameraMode] = useState<"isometric" | "topdown" | "follow">("isometric");
+  // noVNC live-game view: rendered iframe stream from the dashboard server (/vnc).
+  const [viewMode, setViewMode] = useState<"voxel" | "novnc">("voxel");
+  const [vncAvailable, setVncAvailable] = useState<boolean | null>(null);
+  const vncProbeTries = useRef(0);
+
+  // Probe /vnc once on mount (HEAD request) so we can show a helpful hint if the
+  // standalone client container / x11vnc+websockify backend isn't running.
+  useEffect(() => {
+    let cancelled = false;
+    const probe = async () => {
+      try {
+        const r = await fetch("/vnc", { method: "GET" });
+        if (!cancelled) setVncAvailable(r.ok);
+      } catch {
+        if (!cancelled) setVncAvailable(false);
+      }
+    };
+    probe();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -66,6 +86,8 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
   };
 
   const handleMouseUp = () => setIsDragging(false);
+
+  // Pause the voxel render loop while the noVNC stream is shown (saves CPU).
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -354,6 +376,29 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
 
         {/* Camera Modes & Controls */}
         <div className="flex items-center gap-1.5">
+          {/* Voxel Stage vs live noVNC game view */}
+          <button
+            onClick={() => setViewMode("voxel")}
+            className={`px-2 py-1 rounded text-[11px] font-mono transition-colors ${
+              viewMode === "voxel" ? "bg-cyan-950 text-cyan-300 border border-cyan-800" : "bg-slate-850 hover:bg-slate-800 text-slate-400"
+            }`}
+            title="Rendered voxel visualization"
+          >
+            Voxel
+          </button>
+          <button
+            onClick={() => setViewMode("novnc")}
+            className={`px-2 py-1 rounded text-[11px] font-mono transition-colors flex items-center gap-1 ${
+              viewMode === "novnc" ? "bg-orange-950 text-orange-300 border border-orange-800" : "bg-slate-850 hover:bg-slate-800 text-slate-400"
+            }`}
+            title="Live in-game view streamed over noVNC (x11vnc + websockify)"
+          >
+            <MonitorPlay className="h-3.5 w-3.5" />
+            Live noVNC
+          </button>
+
+          <div className="h-3 w-px bg-slate-700 mx-1" />
+
           <button
             onClick={() => setCameraMode("isometric")}
             className={`px-2 py-1 rounded text-[11px] font-mono transition-colors ${
@@ -408,8 +453,31 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
         </div>
       </div>
 
-      {/* 3D Canvas */}
+      {/* 3D Canvas / noVNC live stream */}
       <div ref={containerRef} className="relative w-full h-[400px]">
+        {viewMode === "novnc" ? (
+          vncAvailable === false ? (
+            <div className="w-full h-full flex flex-col items-center justify-center gap-3 bg-slate-950 text-center px-6">
+              <MonitorPlay className="h-8 w-8 text-orange-400" />
+              <p className="text-sm text-slate-300 font-semibold">noVNC backend not reachable at <span className="font-mono">/vnc</span></p>
+              <p className="text-xs text-slate-400 max-w-md">
+                Start the standalone game client with x11vnc + websockify (port 6080), e.g.{" "}
+                <span className="font-mono text-slate-300">docker compose up -d</span>, or set{" "}
+                <span className="font-mono text-slate-300">VNC_WS_PORT</span> on the dashboard server.
+              </p>
+              <a href="/vnc" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 text-xs text-cyan-400 hover:text-cyan-300 underline">
+                <ExternalLink className="h-3 w-3" /> Try opening /vnc directly
+              </a>
+            </div>
+          ) : (
+            <iframe
+              src="/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websocket"
+              title="Live Minecraft game via noVNC"
+              className="w-full h-full block rounded-b-xl border-0 bg-black"
+              allow="fullscreen"
+            />
+          )
+        ) : (
         <canvas
           ref={canvasRef}
           onMouseDown={handleMouseDown}
@@ -418,6 +486,7 @@ export const Visualizer3D: React.FC<Visualizer3DProps> = ({
           onMouseLeave={handleMouseUp}
           className="w-full h-full cursor-grab active:cursor-grabbing block rounded-b-xl"
         />
+        )}
 
         {/* Legend */}
         <div className="absolute bottom-3 right-3 flex items-center gap-3 px-3 py-1.5 rounded-lg bg-slate-950/85 backdrop-blur-md border border-slate-800 text-[11px] font-mono text-slate-300 pointer-events-none">

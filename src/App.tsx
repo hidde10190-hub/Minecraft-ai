@@ -67,7 +67,8 @@ import {
   Square,
   Sparkles,
   MessageSquare,
-  Users
+  Users,
+  MonitorPlay
 } from "lucide-react";
 
 // normalizeBlockId / isExactBlockMatch now live in ./utils/blockMatch (single
@@ -3020,26 +3021,60 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
 
         {/* Tab 1: Workbench & 3D Stage */}
         {activeTab === "workbench" && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            <div className="lg:col-span-7 space-y-6">
-              <Visualizer3D
-                player={player}
-                raycast={raycast}
-                schematicDiffs={diffs}
-                entities={entities}
-                selectedSlot={player.selectedSlot}
-                allAgents={agents}
-                activeAgentId={activeAgentId}
-                onSelectAgent={setActiveAgentId}
-                temporaryScaffolds={temporaryScaffolds}
+          <div className="space-y-6">
+            {/* Dashboard noVNC live stream — real in-game view of the bot/client,
+                proxied by server.ts at /vnc (x11vnc + websockify backend). */}
+            <div className="rounded-xl border border-slate-800 bg-slate-900/60 overflow-hidden">
+              <div className="flex items-center justify-between px-4 py-2.5 border-b border-slate-800 bg-slate-950/60">
+                <div className="flex items-center gap-2">
+                  <MonitorPlay className="h-4 w-4 text-orange-400" />
+                  <span className="text-sm font-semibold text-slate-200">Live Game Stream (noVNC)</span>
+                  <span className="text-[10px] font-mono text-slate-500">dashboard → /vnc → websockify :6080</span>
+                </div>
+                <a
+                  href="/vnc"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="text-[11px] font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 transition-colors"
+                  title="Open the noVNC stream in a full browser tab"
+                >
+                  Open fullscreen ↗
+                </a>
+              </div>
+              <iframe
+                src="/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websocket"
+                title="noVNC live game stream"
+                allow="fullscreen"
+                className="w-full h-[480px] bg-black border-0"
               />
+              <p className="px-4 py-2 text-[11px] text-slate-500">
+                If the stream is blank, start the remote desktop stack with{" "}
+                <span className="font-mono text-slate-400">docker compose up -d</span>{" "}
+                (minecraft-bot service exposes x11vnc + websockify on port 6080).
+              </p>
             </div>
-            <div className="lg:col-span-5 space-y-6">
-              <VirtualController
-                player={player}
-                onDispatchAction={handleDispatchAction}
-                heldKeys={heldKeys}
-              />
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              <div className="lg:col-span-7 space-y-6">
+                <Visualizer3D
+                  player={player}
+                  raycast={raycast}
+                  schematicDiffs={diffs}
+                  entities={entities}
+                  selectedSlot={player.selectedSlot}
+                  allAgents={agents}
+                  activeAgentId={activeAgentId}
+                  onSelectAgent={setActiveAgentId}
+                  temporaryScaffolds={temporaryScaffolds}
+                />
+              </div>
+              <div className="lg:col-span-5 space-y-6">
+                <VirtualController
+                  player={player}
+                  onDispatchAction={handleDispatchAction}
+                  heldKeys={heldKeys}
+                />
+              </div>
             </div>
           </div>
         )}

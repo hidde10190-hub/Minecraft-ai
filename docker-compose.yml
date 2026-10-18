@@ -109,62 +109,40 @@ services:
                (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon || 
                 (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon))"
 
-  web-dashboard:
-    image: node:22-slim
-    container_name: minecraft-ai-dashboard
-    restart: unless-stopped
-    working_dir: /app
-    env_file:
-      - config.env
-    ports:
-      - "3000:3000"
+services:
+  # Headless Minecraft (Mineflayer) bot inside a virtual X display.
+  # x11vnc exposes DISPLAY=:1 on :5900, websockify+noVNC serves it on :6080.
+  minecraft-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: voxel-swarm-bot
     environment:
-      - MINECRAFT_SERVER_HOST=host.docker.internal
-      - MINECRAFT_SERVER_PORT=25565
-      - BRIDGE_HOST=minecraft-standalone-client
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    # Startup speed + resource fairness for the dashboard container:
-    #  - node_modules lives in an NAMED volume instead of a host bind mount. On Docker
-    #    Desktop (Windows/Mac) bind-mounted node_modules is ~10-50x slower, which made
-    #    npm install / vite build crawl and starved CPU while the game was running.
-    #  - cpus/mem_limit guarantee the dashboard can't be squeezed to nothing by the
-    #    Minecraft client, and vice-versa.
-    cpus: '2.0'
-    mem_limit: 3g
+      DISPLAY: ":1"
+      MINECRAFT_HOST: "minecraft-server"
+      MINECRAFT_PORT: "25565"
+      BOT_USERNAME: "SwarmBot"
+    ports:
+      - "6080:6080"   # noVNC web client (http://localhost:6080/vnc.html)
+      - "5900:5900"   # raw VNC (optional, for external VNC viewers)
+    depends_on:
+      - minecraft-server
+    restart: unless-stopped
+
+  minecraft-server:
+    image: itzg/minecraft-server:latest
+    container_name: voxel-swarm-mc
+    environment:
+      EULA: "TRUE"
+      VERSION: "1.20.4"
+      MODE: "creative"
+      ONLINE_MODE: "FALSE"
+      MEMORY: "2G"
+    ports:
+      - "25565:25565"
     volumes:
-      - .:/app
-      - dashboard_node_modules:/app/node_modules
-    command: >
-      bash -c "echo '=====================================================' &&
-               echo ' [Web Dashboard] Initializing environment...' &&
-               echo '=====================================================' &&
-               apt-get update -qq && apt-get install -y -qq curl > /dev/null 2>&1 || true &&
-               if [ ! -d node_modules ] || [ package.json -nt node_modules/.install-stamp ]; then
-                 echo 'Installing dependencies (first run only)...' &&
-                 (npm install --prefer-offline --no-audit --no-fund || (echo 'Retrying npm install...' && sleep 5 && npm install --prefer-offline --no-audit --no-fund)) &&
-                 touch node_modules/.install-stamp
-               else
-                 echo 'Dependencies cached in volume - skipping npm install.'
-               fi && 
-               echo '=====================================================' &&
-               echo ' [Web Dashboard] Building Application...' &&
-               echo '=====================================================' &&
-               (npm run build || (echo 'Build failed, trying clean build...' && rm -rf dist && npm run build)) &&
-               echo '=====================================================' &&
-               echo ' [Web Dashboard] Starting Server on port 3000...' &&
-               echo '=====================================================' &&
-               npm start"
+      - mc-data:/data
+    restart: unless-stopped
 
 volumes:
-  ollama_data:
-  # Gradle dependency + Loom caches (survives container recreation -> fast restarts).
-  # Explicit name so start scripts can reference it deterministically for lock cleanup.
-  gradle_cache:
-    name: minecraft-gradle-cache
-  # Dashboard node_modules kept off the host filesystem for fast npm/vite I/O
-  dashboard_node_modules:
-
-networks:
-  default:
-    name: minecraft-ai-network
+  mc-data:
