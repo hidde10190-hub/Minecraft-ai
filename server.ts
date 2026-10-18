@@ -278,7 +278,7 @@ app.get("/api/health", (req, res) => {
 app.post("/api/nvidia/test", async (req, res) => {
   const startTime = Date.now();
   const apiKey = req.body.apiKey || process.env.NVIDIA_API_KEY;
-  const baseUrl = req.body.baseUrl || process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+  const baseUrl = safeBaseUrl(req.body.baseUrl) || process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
 
   if (!apiKey) {
     return res.status(400).json({ success: false, message: "No NVIDIA API Key configured in .env or request." });
@@ -332,7 +332,41 @@ app.get("/api/minecraft/ping", async (req, res) => {
 // -----------------------------------------------------------------------------
 // LIVE UNIFIED CONFIGURATION ENGINE (Zero-Reboot Server Hot-Reload)
 // -----------------------------------------------------------------------------
-function serializeUnifiedDotEnv(c: any): string {
+// --- Input hardening helpers ------------------------------------------------
+// Bridge ports come from URL path/query parameters and end up inside
+// `http://HOST:${port}`; anything but plain digits (e.g. "1@evil.example") would
+// redirect the request to a different host.
+function isValidPortString(port: unknown): port is string {
+  if (typeof port !== "string" || !/^\d{1,5}$/.test(port)) return false;
+  const n = Number(port);
+  return n >= 1 && n <= 65535;
+}
+
+// Base URLs for AI providers: must be a plain http(s) URL without embedded
+// credentials. Returns the normalised URL (no trailing slash) or null if invalid.
+function safeBaseUrl(raw: unknown): string | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 300) return null;
+  try {
+    const u = new URL(raw.trim());
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    if (u.username || u.password) return null;
+    return u.toString().replace(/\/$/, "");
+  } catch {
+    return null;
+  }
+}
+
+// Values are written between double quotes in config.env/.env. Strip everything that
+// could terminate the value or start a new line (CR/LF, quotes, backslashes, NUL).
+function sanitizeEnvValue(v: any): any {
+  if (typeof v === "string") return v.replace(/[\r\n\0"\\]/g, "");
+  if (Array.isArray(v)) return v.map(sanitizeEnvValue);
+  return v;
+}
+
+function serializeUnifiedDotEnv(rawConfig: any): string {
+  const c: any = {};
+  for (const [k, v] of Object.entries(rawConfig || {})) c[k] = sanitizeEnvValue(v);
   return `# ==============================================================================
 # MINECRAFT AI CONTROLLER & MULTI-AGENT SWARM ENVIRONMENT CONFIGURATION (.env)
 # ==============================================================================
@@ -571,6 +605,13 @@ app.post("/api/env-config", async (req, res) => {
   try {
     const patch = req.body || {};
 
+    // Reject malformed/credentialed base URLs before anything is applied.
+    for (const [k, v] of Object.entries(patch)) {
+      if (/BaseUrl$/.test(k) && v !== "" && v !== undefined && v !== null && safeBaseUrl(v) === null) {
+        return res.status(400).json({ success: false, error: `Invalid URL for ${k}: must be http(s) without credentials` });
+      }
+    }
+
     // Validate & standardize NVIDIA model
     if (patch.nvidiaModel !== undefined) {
       const val = patch.nvidiaModel;
@@ -710,7 +751,7 @@ app.get("/api/export-full-zip", async (req, res) => {
 // Test Ollama Endpoint Diagnostics & Auto-Discovery
 app.post("/api/ollama/test", async (req, res) => {
   const startTime = Date.now();
-  const requestedBase = req.body.baseUrl || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
+  const requestedBase = safeBaseUrl(req.body.baseUrl) || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
   
   const candidateBases = [
     requestedBase,
@@ -1189,7 +1230,7 @@ app.post("/api/ai/reflect", async (req, res) => {
 // Endpoint to list currently pulled local Ollama models
 app.get("/api/ollama/models", async (req, res) => {
   const candidateBases = [
-    (req.query.baseUrl as string) || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
+    safeBaseUrl(req.query.baseUrl) || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434",
     "http://127.0.0.1:11434",
     "http://localhost:11434",
     "http://host.docker.internal:11434"
@@ -1558,6 +1599,7 @@ const bridgeProbeInFlight = new Map<string, Promise<string | null>>();
 const offlinePortWarnThrottler = new Map<string, number>();
 
 async function getWorkingBridgeBase(port: string, requireLive = false): Promise<string | null> {
+  if (!isValidPortString(port)) throw new Error("Invalid bridge port");
   const cached = workingBridgeHosts.get(port);
   if (cached) {
     return cached;
@@ -1870,6 +1912,9 @@ async function handleWsUpgrade(req: any, clientSocket: any, head: Buffer, port: 
 app.all("/api/bridge/:port/*", async (req, res) => {
   const port = req.params.port;
   const subPath = req.params[0];
+  if (!isValidPortString(port)) {
+    return res.status(400).json({ error: "Invalid bridge port" });
+  }
   try {
     const base = await getWorkingBridgeBase(port);
     const targetUrl = `${base}/api/${subPath}`;
@@ -2104,7 +2149,7 @@ Return STRICT JSON matching this schema:
   const apiKeyOverrides = req.body?.apiKeyOverrides || {};
   const preferredProvider = (req.body?.provider || process.env.AI_PROVIDER || "auto").toLowerCase();
   const nvidiaKey = req.body?.nvidiaApiKey || apiKeyOverrides.nvidiaApiKey || process.env.NVIDIA_API_KEY;
-  const nvidiaBaseUrl = req.body?.nvidiaBaseUrl || apiKeyOverrides.nvidiaBaseUrl || process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
+  const nvidiaBaseUrl = safeBaseUrl(req.body?.nvidiaBaseUrl) || safeBaseUrl(apiKeyOverrides.nvidiaBaseUrl) || process.env.NVIDIA_BASE_URL || "https://integrate.api.nvidia.com/v1";
   const preferredNvidiaModel = req.body?.nvidiaModel || apiKeyOverrides.nvidiaModel || process.env.NVIDIA_MODEL || "meta/llama-3.2-11b-vision-instruct";
   const geminiKey = req.body?.geminiApiKey || apiKeyOverrides.geminiApiKey || process.env.GEMINI_API_KEY;
 
@@ -2436,7 +2481,7 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
   const geminiKey = apiKeyOverrides.gemini || process.env.GEMINI_API_KEY;
   const groqKey = apiKeyOverrides.groq || process.env.GROQ_API_KEY || (process.env.GEMINI_API_KEY?.startsWith("gsk_") ? process.env.GEMINI_API_KEY : "");
   const openrouterKey = apiKeyOverrides.openrouter || process.env.OPENROUTER_API_KEY;
-  const nvidiaBaseUrlOverride = apiKeyOverrides.nvidiaBaseUrl || process.env.NVIDIA_BASE_URL;
+  const nvidiaBaseUrlOverride = safeBaseUrl(apiKeyOverrides.nvidiaBaseUrl) || process.env.NVIDIA_BASE_URL;
   const groqBaseUrlOverride = apiKeyOverrides.groqBaseUrl || process.env.GROQ_BASE_URL || "https://api.groq.com/openai/v1";
   const openrouterBaseUrlOverride = apiKeyOverrides.openrouterBaseUrl || process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
 
