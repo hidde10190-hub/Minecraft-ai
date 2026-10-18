@@ -4,6 +4,8 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.minecraft.ai.mixin.KeyBindingAccessor;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.component.SwingAnimation;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
@@ -389,8 +391,8 @@ public class AiInputController {
     public void dropItem(boolean dropAll) {
         Minecraft client = Minecraft.getInstance();
         client.execute(() -> {
-            if (client.player != null) {
-                client.player.drop(dropAll);
+            if (client.player != null && client.gameMode != null) {
+                client.gameMode.dropItem(client.player, dropAll);
             }
         });
     }
@@ -415,7 +417,7 @@ public class AiInputController {
             }
 
             client.gameMode.useItemOn(client.player, hand, hitResult);
-            client.player.swing(hand);
+            client.player.swing(hand, client.player.getItemInHand(hand).getOrDefault(DataComponents.INTERACT_ANIMATION, SwingAnimation.DEFAULT), false);
         });
     }
 
@@ -446,7 +448,7 @@ public class AiInputController {
 
             if (target != null) {
                 client.gameMode.attack(client.player, target);
-                client.player.swing(InteractionHand.MAIN_HAND);
+                client.player.swing(InteractionHand.MAIN_HAND, client.player.getItemInHand(InteractionHand.MAIN_HAND).getOrDefault(DataComponents.ATTACK_ANIMATION, SwingAnimation.DEFAULT), false);
                 lastAttackTick = tickCounter;
 
                 // Human combat follow-up: subtle W-tap or micro-strafe after hitting
