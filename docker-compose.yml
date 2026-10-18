@@ -112,7 +112,6 @@ services:
                (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon || 
                 (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon))"
 
-services:
   # Headless Minecraft (Mineflayer) bot inside a virtual X display.
   # x11vnc exposes DISPLAY=:1 on :5900, websockify+noVNC serves it on :6080.
   minecraft-bot:
