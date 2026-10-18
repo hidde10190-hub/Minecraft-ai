@@ -51,12 +51,24 @@ export interface JournalEntry {
   pos?: [number, number, number];
 }
 
+/** A remembered danger zone (deep water / lava / drowning spot) the bot should avoid. */
+export interface KnownHazard {
+  kind: "water" | "lava" | "drowning" | "fall" | "other";
+  x: number;
+  y: number;
+  z: number;
+  radius: number;
+  description?: string;
+  lastSeen: string;
+}
+
 export interface WorldMemoryData {
   landmarks: Record<string, WorldLandmark>;
   knownResources: Record<string, KnownResource>;
   completedProjects: CompletedProject[];
   failureLessons: MemoryLesson[];
   journal: JournalEntry[];
+  hazards: KnownHazard[];
 }
 
 const STORAGE_KEY = "mc_world_memory_v1";
@@ -67,8 +79,11 @@ const EMPTY_MEMORY: WorldMemoryData = {
   knownResources: {},
   completedProjects: [],
   failureLessons: [],
-  journal: []
+  journal: [],
+  hazards: []
 };
+
+const HAZARD_CAP = 40;
 
 function sanitizeName(name: string): string {
   return (name || "").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 48) || "unnamed";
@@ -84,7 +99,8 @@ export function loadWorldMemoryLocal(): WorldMemoryData {
       knownResources: parsed.knownResources || {},
       completedProjects: Array.isArray(parsed.completedProjects) ? parsed.completedProjects : [],
       failureLessons: Array.isArray(parsed.failureLessons) ? parsed.failureLessons : [],
-      journal: Array.isArray(parsed.journal) ? parsed.journal : []
+      journal: Array.isArray(parsed.journal) ? parsed.journal : [],
+      hazards: Array.isArray(parsed.hazards) ? parsed.hazards : []
     };
   } catch {
     return JSON.parse(JSON.stringify(EMPTY_MEMORY));
@@ -108,7 +124,11 @@ export function mergeRemoteMemory(remote: Partial<WorldMemoryData> | null | unde
     knownResources: { ...(remote.knownResources || {}), ...local.knownResources },
     completedProjects: dedupeById([...(remote.completedProjects || []), ...(local.completedProjects || [])], (p) => `${p.name}@${(p.center || []).join(",")}`),
     failureLessons: dedupeById([...(remote.failureLessons || []), ...(local.failureLessons || [])], (l) => l.lesson),
-    journal: [...(remote.journal || []), ...(local.journal || [])].slice(-JOURNAL_CAP)
+    journal: [...(remote.journal || []), ...(local.journal || [])].slice(-JOURNAL_CAP),
+    hazards: dedupeById(
+      [...(Array.isArray(remote.hazards) ? remote.hazards : []), ...(local.hazards || [])],
+      (h) => `${h.kind}@${Math.round(h.x / 4)},${Math.round(h.y / 4)},${Math.round(h.z / 4)}`
+    ).slice(-HAZARD_CAP)
   };
   saveWorldMemoryLocal(merged);
   return merged;
@@ -180,6 +200,37 @@ export function noteLessonLocal(lesson: string, context: string): void {
   }
 }
 
+/** Record a danger zone (deep water / drowning spot / lava) so it persists across sessions. */
+export function noteHazardLocal(kind: KnownHazard["kind"], x: number, y: number, z: number, radius = 8, description = ""): void {
+  const mem = loadWorldMemoryLocal();
+  const now = new Date().toISOString();
+  // Merge into an existing hazard of the same kind within ~4 blocks; otherwise append.
+  const existing = mem.hazards.find(
+    (h) => h.kind === kind && Math.hypot(h.x - x, h.y - y, h.z - z) <= 4
+  );
+  if (existing) {
+    // Grow the radius to cover both spots, keep newest timestamp.
+    const far = Math.hypot(existing.x - x, existing.y - y, existing.z - z);
+    existing.radius = Math.max(existing.radius, radius, Math.ceil(far + radius));
+    existing.lastSeen = now;
+    if (description) existing.description = description;
+  } else {
+    mem.hazards.push({ kind, x: Math.round(x), y: Math.round(y), z: Math.round(z), radius, description, lastSeen: now });
+    if (mem.hazards.length > HAZARD_CAP) mem.hazards.splice(0, mem.hazards.length - HAZARD_CAP);
+  }
+  saveWorldMemoryLocal(mem);
+  recordJournalLocal("hazard", `${kind} hazard @ [${Math.round(x)}, ${Math.round(y)}, ${Math.round(z)}] r=${radius} ${description}`.trim(), [x, y, z]);
+}
+
+/** True if (x,y,z) is inside any remembered hazard zone. */
+export function isInsideKnownHazard(x: number, y: number, z: number): KnownHazard | null {
+  const mem = loadWorldMemoryLocal();
+  for (const h of mem.hazards) {
+    if (Math.hypot(h.x - x, h.y - y, h.z - z) <= h.radius) return h;
+  }
+  return null;
+}
+
 /** Distance-aware briefing text for injection into any prompt (LLM or built-in AI). */
 export function buildMemoryBriefingLocal(pos: { x?: number; y?: number; z?: number }): string {
   const mem = loadWorldMemoryLocal();
@@ -210,6 +261,14 @@ export function buildMemoryBriefingLocal(pos: { x?: number; y?: number; z?: numb
   if (mem.failureLessons.length > 0) {
     lines.push("STANDING LESSONS FROM THE PAST:");
     mem.failureLessons.slice(-6).forEach((f) => lines.push(`- ${f.lesson} (${f.context})`));
+  }
+  if (mem.hazards.length > 0) {
+    lines.push("KNOWN HAZARD ZONES (avoid these - deep water/drowning, lava, falls):");
+    mem.hazards.slice(-8).forEach((h) => {
+      const d = Math.hypot(h.x - px, h.y - py, h.z - pz).toFixed(0);
+      lines.push(`- ${h.kind}: center [${h.x}, ${h.y}, ${h.z}] radius ~${h.radius}m (${d}m away)${h.description ? " - " + h.description : ""}`);
+    });
+    lines.push("RULE: never linger submerged with low air; if a build site is inside a hazard zone, build a dry platform/pillar first or route around it.");
   }
   const recent = mem.journal.slice(-5);
   if (recent.length > 0) {

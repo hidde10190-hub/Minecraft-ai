@@ -21,6 +21,35 @@ export function blockTokens(name: string): string[] {
   return String(name || "").toLowerCase().replace(/^minecraft:/, "").split(/[^a-z0-9]+/).filter(Boolean);
 }
 
+/** Canonicalize a block/item ID for EXACT comparison: strip namespace, block
+ *  state suffixes ([...]), trailing "_block", and normalize singular/plural
+ *  variants (plank->planks, stone_brick->stone_bricks). Shared by App.tsx so
+ *  hotbar matching never depends on cosmetic ID spelling differences. */
+export function normalizeBlockId(block: string | undefined | null): string {
+  if (!block) return "";
+  let b = String(block).toLowerCase().trim().replace(/^minecraft:/, "");
+  if (b.includes("[")) b = b.split("[")[0].trim();
+  b = b.replace(/_block$/, "");
+  if (b === "grass") return "short_grass";
+  if (b === "stone_brick") return "stone_bricks";
+  if (b === "plank") return "planks";
+  if (b === "oak_plank") return "oak_planks";
+  if (b === "spruce_plank") return "spruce_planks";
+  if (b === "birch_plank") return "birch_planks";
+  if (b === "dark_oak_plank") return "dark_oak_planks";
+  if (b === "brick") return "bricks";
+  return b;
+}
+
+/** Strict exact-match check between a held item and an expected block ID.
+ *  Returns false for air/empty; otherwise compares canonicalized IDs. */
+export function isExactBlockMatch(heldItem: string | undefined | null, expectedBlock: string | undefined | null): boolean {
+  const a = normalizeBlockId(heldItem);
+  const b = normalizeBlockId(expectedBlock);
+  if (!a || !b || a === "air" || b === "air") return false;
+  return a === b;
+}
+
 /** True if two full block/item IDs refer to the same material family (never across families). */
 export function blockNamesCompatible(aRaw: string, bRaw: string): boolean {
   const a = String(aRaw || "").toLowerCase().replace(/^minecraft:/, "");

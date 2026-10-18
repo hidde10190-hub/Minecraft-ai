@@ -4371,6 +4371,49 @@ async function startServer() {
     });
   }
 
+  // ===========================================================================
+  // noVNC PROXY (bug 1): expose the live Minecraft client screen inside the
+  // dashboard. GET /vnc serves a small page embedding noVNC; the WebSocket at
+  // /vnc/websocket is piped straight to websockify (port 6080) on the standalone
+  // container, which in turn bridges it to x11vnc mirroring the Xvfb display.
+  // Works both in Docker (BRIDGE_HOST=minecraft-standalone-client) and locally
+  // (127.0.0.1:6080 when running x11vnc+websockify on the host).
+  // ===========================================================================
+  const VNC_BRIDGE_HOST = process.env.BRIDGE_HOST || "127.0.0.1";
+  const VNC_WS_PORT = Number(process.env.VNC_WS_PORT || 6080);
+
+  const vncPage = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Live Game - noVNC</title>
+<style>html,body{margin:0;height:100%;background:#0b0f14}iframe{width:100%;height:100%;border:0;display:block}</style>
+</head><body>
+<iframe src="/vnc/vnc.html?autoconnect=true&resize=scale&path=vnc/websocket" allow="fullscreen"></iframe>
+</body></html>`;
+
+  app.get("/vnc", (_req: any, res: any) => {
+    res.setHeader("Cache-Control", "no-store");
+    res.type("html").send(vncPage);
+  });
+
+  // Serve the noVNC static client files (vnc.html, core/*.js) from the container/host.
+  const NOVNC_WEB_DIRS = ["/usr/share/novnc", "/opt/novnc", path.join(process.cwd(), "novnc")];
+  const novncRoot = NOVNC_WEB_DIRS.find((d) => { try { return fs.existsSync(path.join(d, "vnc.html")); } catch { return false; } });
+  if (novncRoot) {
+    app.use("/vnc", express.static(novncRoot, { index: "vnc.html" }));
+  } else {
+    // No local copy of noVNC assets (common when dashboard runs outside the client
+    // container): reverse-proxy static requests through to websockify's built-in
+    // HTTP server which does serve them.
+    app.use("/vnc", (req: any, res: any, next: any) => {
+      if (req.path === "/websocket") return next();
+      const proxyReq = http.request(
+        { host: VNC_BRIDGE_HOST, port: VNC_WS_PORT, path: req.originalUrl.replace(/^\/vnc/, ""), method: req.method, headers: { ...req.headers, host: `${VNC_BRIDGE_HOST}:${VNC_WS_PORT}` } },
+        (pr) => { res.writeHead(pr.statusCode || 502, pr.headers); pr.pipe(res); }
+      );
+      proxyReq.on("error", () => { res.status(502).send("noVNC backend unreachable - is the standalone client container running with x11vnc/websockify?"); });
+      req.pipe(proxyReq);
+    });
+  }
+
   const server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Minecraft-AI-Bridge] Web Studio listening on http://0.0.0.0:${PORT}`);
   });
@@ -4383,10 +4426,35 @@ async function startServer() {
       const m = url.pathname.match(/^\/api\/bridge\/(\d+)\/ws\/?$/);
       if (m) {
         handleWsUpgrade(req, socket, head, m[1]);
-      } else {
-        socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
-        socket.destroy();
+        return;
       }
+      // noVNC WebSocket tunnel: /vnc/websocket -> websockify on the client container.
+      if (/^\/vnc\/websocket\/?$/.test(url.pathname)) {
+        const upstream = net.connect(VNC_WS_PORT, VNC_BRIDGE_HOST, () => {
+          const lines = [
+            `GET ${url.pathname.replace(/\/$/, "")}${url.search || ""} HTTP/1.1`,
+            `Host: ${VNC_BRIDGE_HOST}:${VNC_WS_PORT}`,
+            `Upgrade: ${req.headers.upgrade || "websocket"}`,
+            `Connection: Upgrade`,
+            `Sec-WebSocket-Key: ${req.headers["sec-websocket-key"] || ""}`,
+            `Sec-WebSocket-Version: ${req.headers["sec-websocket-version"] || "13"}`,
+            ...(req.headers["sec-websocket-protocol"] ? [`Sec-WebSocket-Protocol: ${req.headers["sec-websocket-protocol"]}`] : []),
+            "",
+            "",
+          ];
+          upstream.write(lines.join("\r\n"));
+          if (head && head.length) upstream.write(head);
+          socket.pipe(upstream).pipe(socket);
+        });
+        upstream.on("error", (e: any) => {
+          console.warn(`[noVNC Tunnel] upstream error: ${e?.message}`);
+          try { socket.destroy(); } catch {}
+        });
+        socket.on("error", () => { try { upstream.destroy(); } catch {} });
+        return;
+      }
+      socket.write("HTTP/1.1 426 Upgrade Required\r\nConnection: close\r\n\r\n");
+      socket.destroy();
     } catch (err: any) {
       console.warn(`[WS Tunnel] Upgrade handler error: ${err?.message}`);
       try { socket.destroy(); } catch {}

@@ -30,8 +30,8 @@ import { normalizeLivePlayerState, normalizeLiveHotbar } from "./utils/playerSta
 import { loadSavedEnvConfig, persistEnvConfig, fetchServerEnvConfig } from "./utils/envConfigManager";
 import { evaluateMessageForSwarm } from "./utils/signAndMessageIntelligence";
 import { CognitiveFeedbackEngine } from "./utils/cognitiveFeedbackEngine";
-import { blockNamesCompatible, isExactBlockMatch, isPlaceableBlockItem } from "./utils/blockMatch";
-import { buildMemoryBriefingLocal, noteResourceSightingLocal, recordJournalLocal, noteProjectDoneLocal, pullMemoryFromServer, syncMemoryToServer, rememberLandmarkLocal } from "./utils/worldMemory";
+import { blockNamesCompatible, normalizeBlockId, isExactBlockMatch, isPlaceableBlockItem } from "./utils/blockMatch";
+import { buildMemoryBriefingLocal, noteResourceSightingLocal, recordJournalLocal, noteProjectDoneLocal, pullMemoryFromServer, syncMemoryToServer, rememberLandmarkLocal, noteHazardLocal } from "./utils/worldMemory";
 import { designAiHouse } from "./utils/aiHouseArchitect";
 import { 
   PlayerState, 
@@ -69,28 +69,12 @@ import {
   Users
 } from "lucide-react";
 
-export function normalizeBlockId(block: string | undefined | null): string {
-  if (!block) return "";
-  let b = String(block).toLowerCase().trim().replace(/^minecraft:/, "");
-  if (b.includes("[")) b = b.split("[")[0].trim();
-  b = b.replace(/_block$/, "");
-  if (b === "grass") return "short_grass";
-  if (b === "stone_brick") return "stone_bricks";
-  if (b === "plank") return "planks";
-  if (b === "oak_plank") return "oak_planks";
-  if (b === "spruce_plank") return "spruce_planks";
-  if (b === "birch_plank") return "birch_planks";
-  if (b === "dark_oak_plank") return "dark_oak_planks";
-  if (b === "brick") return "bricks";
-  return b;
-}
-
-export function isExactBlockMatch(heldItem: string | undefined | null, expectedBlock: string | undefined | null): boolean {
-  const a = normalizeBlockId(heldItem);
-  const b = normalizeBlockId(expectedBlock);
-  if (!a || !b || a === "air" || b === "air") return false;
-  return a === b;
-}
+// normalizeBlockId / isExactBlockMatch now live in ./utils/blockMatch (single
+// shared implementation). The previous local copy here SHADOWED the import, and
+// combined with an exact-only comparison it silently broke auto-build: any
+// spelling difference between schematic expectedBlock and real hotbar item IDs
+// (e.g. "oak_planks" vs "planks[oak]", "_block" suffixes) made every placement
+// look like a wrong-material mismatch, so the bot refused to build houses.
 
 export default function App() {
   const [envConfig, setEnvConfig] = useState<UnifiedEnvConfig>(() => loadSavedEnvConfig());
@@ -1295,6 +1279,38 @@ export default function App() {
       return;
     }
 
+    // 7b. Equip by item name - find the hotbar slot holding that item and select it.
+    // Fixes house-building stalls where the AI says "equip minecraft:oak_planks"
+    // but the bridge only understood numeric slot selection (item stayed in hand = air).
+    if (rawActionType === "equip_item" || rawActionType === "equip_by_name" || rawActionType === "give_equip") {
+      const wanted = String((action as any).item || (action as any).name || (action as any).block || "").trim();
+      if (wanted) {
+        const hb = currentP.hotbar || [];
+        let foundSlot = hb.findIndex((st: any) => st && st.item && st.count > 0 && isExactBlockMatch(st.item, wanted));
+        if (foundSlot === -1) {
+          foundSlot = hb.findIndex((st: any) => st && st.item && st.count > 0 && blockNamesCompatible(st.item, wanted));
+        }
+        if (foundSlot !== -1) {
+          setPlayer((p) => ({ ...p, selectedSlot: foundSlot }));
+          setAgents((prev) =>
+            prev.map((ag) => (ag.id === targetAgentId ? { ...ag, player: { ...ag.player, selectedSlot: foundSlot } } : ag))
+          );
+          sendActionToBridge({ type: "select_hotbar", slot: foundSlot, agentId: targetAgentId });
+          setChatMessages((prev) => [
+            ...prev,
+            { id: `eq_${Date.now()}`, sender: "System", text: `[Equip] Slot ${foundSlot} now holds ${hb[foundSlot].item} ("${wanted}").`, timestamp: Date.now(), channel: "all", isAi: true },
+          ]);
+        } else {
+          noteLessonLocal(`Cannot equip ${wanted}: not present in hotbar`, "equip_item lookup failed");
+          setChatMessages((prev) => [
+            ...prev,
+            { id: `eq_${Date.now()}`, sender: "System", text: `[Equip] Not carrying "${wanted}" in the hotbar - gather or craft it first.`, timestamp: Date.now(), channel: "all", isAi: true },
+          ]);
+        }
+      }
+      return;
+    }
+
     if (action.type === "look_at") {
       let targetX: number | undefined = action.x !== undefined ? Number(action.x) : undefined;
       let targetY: number | undefined = action.y !== undefined ? Number(action.y) : undefined;
@@ -2198,6 +2214,62 @@ export default function App() {
 
     return () => clearInterval(cognitionInterval);
   }, [isAutonomousMode, isConnected, isLoadingAi, activeGoal, activeAgentId, activeAgent.role, activeAgent.name, envConfig.aiAutonomyIntervalSeconds, provider, chatSettings.personaTone]);
+
+  // ===========================================================================
+  // DROWNING PREVENTION WATCHDOG
+  // Monitors breath/air level every second. If the player is submerged and air
+  // drops below thresholds: jump toward the surface, then as a last resort
+  // place a block underfoot to stand on (classic MC pillar escape). Every
+  // drowning event is written into persistent world memory as a hazard zone so
+  // the AI briefing warns about this spot in future sessions too.
+  // ===========================================================================
+  const drownGuardRef = useRef({ warnedAt: 0, escapedAt: 0 });
+  useEffect(() => {
+    const CHECK_MS = 1000;
+    const timer = setInterval(() => {
+      const p = playerRef.current;
+      if (!p) return;
+      const air = typeof p.air === "number" ? p.air : 300;
+      const submerged = p.inWater === true || air < 300;
+
+      // Recovered at surface - reset throttle.
+      if (!submerged && air >= 290) {
+        drownGuardRef.current.warnedAt = 0;
+        return;
+      }
+
+      const now = Date.now();
+
+      // Low air while underwater: spam jump (surface bob) + log warning once per 10s.
+      if (submerged && air < 150) {
+        sendActionToBridge({ type: "press_key", key: "space", durationMs: 400 });
+        sendActionToBridge({ type: "look_at", pitch: -60, yaw: p.yaw, ticks: 2 }); // aim up toward sky/surface
+        if (now - drownGuardRef.current.warnedAt > 10000) {
+          drownGuardRef.current.warnedAt = now;
+          setThoughtLog((t) => [`[Survival]: Air low (${air}/300)! Surfacing - jumping upward out of water.`, ...t.slice(0, 30)]);
+        }
+      }
+
+      // Critical: about to drown. Remember the spot as a permanent hazard, and
+      // try the block-under-feet escape (only fires once per 20s to avoid spam).
+      if (submerged && air < 60 && now - drownGuardRef.current.escapedAt > 20000) {
+        drownGuardRef.current.escapedAt = now;
+        noteHazardLocal("drowning", p.x, p.y, p.z, 10, `air hit ${air}/300 here`);
+        syncMemoryToServer().catch(() => {});
+        setThoughtLog((t) => [`[Survival]: DANGEROUS WATER marked at [${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)}] - saved to persistent memory. Attempting block pillar escape.`, ...t.slice(0, 30)]);
+        // Find any solid block in the hotbar and place it beneath the feet.
+        const blockSlot = (p.hotbar || []).findIndex((st: any) => st && st.item && st.count > 0 && isPlaceableBlockItem(st.item));
+        if (blockSlot !== -1) {
+          handleDispatchAction({ type: "select_hotbar", slot: blockSlot });
+          setTimeout(() => {
+            handleDispatchAction({ type: "place_block", x: Math.floor(p.x), y: Math.floor(p.y) - 1, z: Math.floor(p.z) });
+            handleDispatchAction({ type: "press_key", key: "space", durationMs: 500 });
+          }, 250);
+        }
+      }
+    }, CHECK_MS);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let timer: any = null;
