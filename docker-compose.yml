@@ -42,6 +42,9 @@ services:
       - LIBGL_ALWAYS_SOFTWARE=1
       - MESA_GL_VERSION_OVERRIDE=4.5
       - MESA_GLSL_VERSION_OVERRIDE=450
+      # SDL (Minecraft 26) vraagt een sRGB/multisample-framebuffer die GLX op Xvfb niet levert; EGL wel.
+      - SDL_VIDEO_X11_FORCE_EGL=1
+      - SDL_VIDEO_FORCE_EGL=1
       - JAVA_TOOL_OPTIONS=-Xmx4G -Xms512M -Dfabric.gui.disable=true -XX:+PerfDisableSharedMem
     # Resources: sized for a smooth client. NOTE: on Docker Desktop (Windows/Mac) these
     # limits only help if the WSL2/VM total allocation in Docker Settings is raised too
@@ -90,7 +93,7 @@ services:
     security_opt:
       - no-new-privileges:true
     command: >
-      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb x11vnc libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils gcc libc6-dev novnc websockify > /tmp/apt.log 2>&1 || (echo '[apt] installatie MISLUKT:'; tail -5 /tmp/apt.log) &&
+      bash -c "apt-get update -qq && apt-get install -y -qq --no-install-recommends xvfb x11vnc libgl1-mesa-dri libgl1 libxi6 libxrender1 libxtst6 libxcursor1 libxrandr2 libxext6 libx11-6 pciutils gcc libc6-dev libegl1 libegl-mesa0 libgles2 novnc websockify > /tmp/apt.log 2>&1 || (echo '[apt] installatie MISLUKT:'; tail -5 /tmp/apt.log) &&
                printf '#include <fcntl.h>\n#include <unistd.h>\n#include <sys/ioctl.h>\n#include <linux/uinput.h>\nint main(){int fd=open(\"/dev/uinput\",O_WRONLY);if(fd<0)return 1;return ioctl(fd,UI_DEV_CREATE,0)==0?0:2;}\n' > /tmp/ui.c && (gcc -o /usr/local/bin/uinput-create /tmp/ui.c 2>/dev/null || true) &&
                mkdir -p /app/framework/run/config &&
                (modprobe uinput 2>/dev/null || true) &&
