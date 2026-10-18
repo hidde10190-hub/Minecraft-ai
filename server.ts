@@ -2022,12 +2022,27 @@ function keywordMatchesBlock(kwRaw: string, blockNameRaw: string): boolean {
 }
 
 /** Is an item ID placeable as a block (not air/tool/weapon/armor/food)? */
+const NON_BLOCK_TRAPS = new Set([
+  "redstone", "glowstone_dust", "ender_pearl", "blaze_rod", "breeze_rod", "bone",
+  "nether_wart", "wheat", "honey_bottle", "dragon_breath", "fire_charge", "snowball",
+]);
 function isPlaceableBlockItem(itemRaw: any): boolean {
   const s = String(itemRaw?.item ?? itemRaw ?? "").toLowerCase().replace(/^minecraft:/, "");
   if (!s || s === "air") return false;
+  if (NON_BLOCK_TRAPS.has(s)) return false;
   if (typeof itemRaw?.isBlock === "boolean") return itemRaw.isBlock;
-  if (/pickaxe|axe(?!_)|sword|shovel|hoe|bow|crossbow|shield|helmet|chestplate|leggings|boots|elytra|stick|apple|bread|meat|cooked|potion|bucket|tnt|flint_and_steel|shears|rod|fishing/.test(s) && !/_planks|_log|_slab|_stairs|torch/.test(s)) return false;
-  if (s === "stick" || s.endsWith("_sword") || s.endsWith("_pickaxe") || s.endsWith("_axe") || s.endsWith("_shovel") || s.endsWith("_hoe")) return false;
+  const toks = s.split(/[^a-z0-9]+/).filter(Boolean);
+  const last = toks[toks.length - 1] || "";
+  const toolTok = ["pickaxe", "axe", "shovel", "hoe", "shears", "brush"];
+  const weaponTok = ["sword", "bow", "trident", "mace", "crossbow", "shield"];
+  const armorTok = ["helmet", "chestplate", "leggings", "boots", "elytra"];
+  const foodTok = ["apple", "bread", "beef", "porkchop", "mutton", "chicken", "stew", "soup", "cookie", "cake"];
+  if (toolTok.includes(last) || toolTok.includes(s)) return false;
+  if (weaponTok.includes(last) || weaponTok.includes(s)) return false;
+  if (armorTok.includes(last) || armorTok.includes(s)) return false;
+  if (s === "fishing_rod" || s === "flint_and_steel" || s === "clock" || s === "compass" || s === "map" || s === "stick" || s === "string" || s === "feather") return false;
+  if (s.endsWith("_bucket") || s.endsWith("_potion") || s.startsWith("potion") || s.endsWith("_boat") || s.endsWith("_minecart") || s.endsWith("_seeds") || s.endsWith("_spawn_egg") || s.startsWith("music_disc") || s.endsWith("_ingot") || s.endsWith("_shard")) return false;
+  if (foodTok.some((t) => toks.includes(t))) return false;
   return true;
 }
 
@@ -2046,9 +2061,13 @@ function getEffectiveHotbar(telemetry: any): any[] {
   // make slot indices point at the WRONG item (root cause of "placing the axe/hand":
   // a plan selects slot N but the filtered array's slot N holds a different item).
   let hb: any[] = Array.isArray(player.hotbar) ? player.hotbar.map((s: any, i: number) => ({ slot: i, ...s })) : [];
-  if (hb.length === 0 && Array.isArray(telemetry?.inventory)) {
+  // The Fabric bridge exports `inventory` at the ROOT of the telemetry packet
+  // (root.add("inventory", invArray)), NOT inside `player`. Search both places or
+  // reconstruction silently fails and every slot lookup falls back to air/slot 0.
+  const invList = Array.isArray(player.inventory) ? player.inventory : telemetry?.inventory;
+  if (hb.length === 0 && Array.isArray(invList)) {
     hb = Array.from({ length: 9 }).map((_, i) => {
-      const found = telemetry.inventory.find((inv: any) =>
+      const found = invList.find((inv: any) =>
         inv &&
         inv.region !== "armor" && inv.region !== "equipment" && inv.region !== "offhand" &&
         (inv.slot === i || inv.slot === i + 36 || (inv.region === "hotbar" && (inv.slot === i || inv.slot === -1))) &&
@@ -2599,9 +2618,10 @@ async function executeUnifiedAiPlan(req: express.Request, providerPreference: st
   };
 
   let hotbarSlots: any[] = Array.isArray(player.hotbar) && player.hotbar.length > 0 ? player.hotbar : [];
-  if (hotbarSlots.length === 0 && Array.isArray(telemetry?.inventory)) {
+  const invListPrompt = Array.isArray(player.inventory) ? player.inventory : telemetry?.inventory;
+  if (hotbarSlots.length === 0 && Array.isArray(invListPrompt)) {
     hotbarSlots = Array.from({ length: 9 }).map((_, i) => {
-      const found = telemetry.inventory.find((inv: any) => 
+      const found = invListPrompt.find((inv: any) => 
         inv && 
         inv.region !== "armor" && 
         inv.region !== "equipment" &&
@@ -3687,6 +3707,12 @@ function postProcessPlanWithLearning(result: any, req: any): any {
   const telemetry = req.body?.telemetry || {};
   const player = telemetry.player || {};
   const hotbar = getEffectiveHotbar(telemetry);
+  // True only when the bridge actually reported non-empty hotbar/inventory stacks.
+  // When false, guards must trust main_hand/selected-slot ground truth instead of
+  // dropping placements (dropping-everything made the bot stop placing entirely).
+  const playerHasRealHotbarData = Array.isArray(player.hotbar) && player.hotbar.length > 0
+    ? player.hotbar.some((s: any) => s && s.item && String(s.item).toLowerCase() !== "minecraft:air")
+    : hotbar.some((s: any) => s && s.item && String(s.item).toLowerCase() !== "minecraft:air" && Number(s.count || 1) > 0);
   const selectedSlot = player.selectedSlot ?? player.selected_slot ?? 0;
   let activeHeldItem = (hotbar[selectedSlot]?.item || player.heldItem?.item || player.main_hand?.item || "air").replace(/^minecraft:/, "");
   const goal = (req.body?.goal || "").toLowerCase();
@@ -3769,13 +3795,26 @@ function postProcessPlanWithLearning(result: any, req: any): any {
       const okStack = (s: any) => isPlaceableBlockItem(s) && Number(s?.count || 1) > 0 && normId(s) !== "air";
       let chosenSlot = -1;
       if (expRaw) {
-        // 1) exact ID match in the REAL hotbar, 2) token-family-compatible match.
-        chosenSlot = hotbar.findIndex((s: any) => okStack(s) && normId(s) === expRaw);
-        if (chosenSlot < 0) chosenSlot = hotbar.findIndex((s: any) => okStack(s) && blockNamesCompatible(normId(s), expRaw));
-        if (chosenSlot < 0) {
-          // Material not available: NEVER substitute an unrelated block - drop it.
-          act.__drop = true;
-          failureAlerts.push(`Dropped place_block at [${act.x},${act.y},${act.z}]: '${expRaw}' is not in the hotbar (refusing to place a wrong block).`);
+        // 0) The slot ALREADY selected holds the expected material -> don't touch it.
+        //    (Previously the guard only searched the hotbar array; when telemetry was
+        //    incomplete every placement got dropped => "not placing blocks anymore".)
+        const heldNorm = normId(held);
+        if (okStack(held) && (heldNorm === expRaw || blockNamesCompatible(heldNorm, expRaw))) {
+          chosenSlot = slotIdx;
+        } else {
+          // 1) exact ID match in the REAL hotbar, 2) token-family-compatible match.
+          chosenSlot = hotbar.findIndex((s: any) => okStack(s) && normId(s) === expRaw);
+          if (chosenSlot < 0) chosenSlot = hotbar.findIndex((s: any) => okStack(s) && blockNamesCompatible(normId(s), expRaw));
+          if (chosenSlot < 0 && !playerHasRealHotbarData) {
+            // Hotbar telemetry is empty/unknown: trust the ground-truth held item.
+            // Refusing here blocked placements that would have succeeded in-game.
+            if (okStack(held)) chosenSlot = slotIdx >= 0 ? slotIdx : selectedSlot;
+          }
+          if (chosenSlot < 0) {
+            // Material genuinely not available: NEVER substitute an unrelated block - drop it.
+            act.__drop = true;
+            failureAlerts.push(`Dropped place_block at [${act.x},${act.y},${act.z}]: '${expRaw}' is not in the hotbar (refusing to place a wrong block).`);
+          }
         }
       } else if (!isPlaceableBlockItem(held) || Number(held?.count || 0) <= 0) {
         chosenSlot = hotbar.findIndex((s: any) => okStack(s));

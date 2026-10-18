@@ -40,16 +40,39 @@ const enrichItemMetadata = (slotObj: HotbarSlot): HotbarSlot => {
   if (clean === "air" || slotObj.count <= 0) {
     return { slot: slotObj.slot, item: "minecraft:air", count: 0 };
   }
-  const isTool = clean.includes("pickaxe") || clean.includes("axe") || clean.includes("shovel") || clean.includes("hoe") || clean.includes("shears") || clean.includes("fishing_rod") || clean.includes("flint_and_steel");
-  const isWeapon = clean.includes("sword") || clean.includes("bow") || clean.includes("trident") || clean.includes("mace") || clean.includes("crossbow") || clean.includes("shield");
-  const isFood = clean.includes("beef") || clean.includes("porkchop") || clean.includes("bread") || clean.includes("apple") || clean.includes("golden_") || clean.includes("carrot") || clean.includes("potato") || clean.includes("mutton") || clean.includes("chicken") || clean.includes("cookie") || clean.includes("stew") || clean.includes("pie");
-  const isBlock = !isTool && !isWeapon && !isFood && (
-    clean.includes("stone") || clean.includes("brick") || clean.includes("planks") || 
-    clean.includes("log") || clean.includes("wood") || clean.includes("dirt") || 
-    clean.includes("sand") || clean.includes("glass") || clean.includes("obsidian") || 
-    clean.includes("cobblestone") || clean.includes("terracotta") || clean.includes("concrete") || 
-    clean.includes("wool") || clean.includes("ore") || clean.includes("torch") || clean.includes("slab") || clean.includes("stairs")
-  );
+  // Token-aware tool/weapon/food classification. The old substring tests wrongly
+  // flagged items like "polished_blackstone" (contains "hoe"? no, but "tripwire_hook"
+  // contains "hoe", "coarse_dirt"... regardless) and, worse, the isBlock WHITELIST
+  // marked most real blocks (andesite, granite, bedrock, mud, most slabs/walls) as
+  // NOT blocks - which made the placement guards refuse valid stacks ("not placing
+  // anymore"). Now: tools/weapons/food are detected by underscore TOKENS only, and
+  // isBlock defaults TRUE unless the item is a known non-placeable item.
+  const toks = clean.split(/[^a-z0-9]+/).filter(Boolean);
+  const hasTok = (...names: string[]) => names.some((n) => toks.includes(n));
+  const isTool = hasTok("pickaxe", "axe", "shovel", "hoe", "shears", "brush") ||
+    clean === "fishing_rod" || clean === "flint_and_steel";
+  const isWeapon = hasTok("sword", "bow", "trident", "mace", "crossbow", "shield");
+  const isFood = hasTok("apple", "bread", "beef", "porkchop", "mutton", "chicken", "rabbit", "cod", "salmon", "tropical_fish", "pufferfish", "cookie", "pie", "cake", "stew", "soup", "carrot", "potato", "beetroot", "melon", "sugar", "dried_kelp", "chorus_fruit") || clean.startsWith("golden_") || clean.endsWith("_berries");
+  const NON_BLOCK_EXACT = new Set([
+    "stick", "string", "feather", "leather", "flint", "gunpowder", "bone", "arrow", "ink_sac",
+    "glowstone_dust", "redstone", "lapis_lazuli", "coal", "charcoal", "diamond", "emerald",
+    "gold_ingot", "iron_ingot", "copper_ingot", "netherite_ingot", "netherite_scrap", "amethyst_shard",
+    "quartz", "clay_ball", "paper", "book", "writable_book", "signed_book", "map", "compass",
+    "clock", "lead", "name_tag", "saddle", "bucket", "water_bucket", "lava_bucket", "milk_bucket",
+    "powder_snow_bucket", "egg", "snowball", "bone_meal", "ender_pearl", "blaze_rod", "ghast_tear",
+    "slime_ball", "magma_cream", "fermented_spider_eye", "spider_eye", "phantom_membrane",
+    "experience_bottle", "firework_rocket", "totem_of_undying", "record", "nautilus_shell",
+    "heart_of_the_sea", "turtle_scute", "scute", "shulker_shell", "wind_charge", "breeze_rod",
+    "ender_eye", "blaze_powder", "dragon_breath", "nether_wart", "wheat", "honeycomb", "amethyst_block_x",
+  ]);
+  const isNonPlaceableItem = NON_BLOCK_EXACT.has(clean) ||
+    clean.endsWith("_seed") || clean.endsWith("_seeds") || clean.endsWith("_bucket") ||
+    clean.endsWith("_dust") || clean.endsWith("_ingot") || clean.endsWith("_shard") ||
+    clean.endsWith("_disc") || clean.startsWith("music_disc") || clean.endsWith("_spawn_egg") ||
+    clean.endsWith("_potion") || clean === "potion" || clean.endsWith("_boat") ||
+    clean.endsWith("_minecart") || clean === "minecart" || clean.endsWith("_banner") ||
+    clean.endsWith("_skull") || clean === "dragon_head" || clean.includes("armor_stand");
+  const isBlock = !isTool && !isWeapon && !isFood && !isNonPlaceableItem;
 
   return {
     ...slotObj,

@@ -68,12 +68,35 @@ export function blockNamesCompatible(aRaw: string, bRaw: string): boolean {
   return false;
 }
 
-/** Is an item stack placeable as a block (not air/tool/weapon/armor/food)? */
+/** Item IDs that look block-ish but are NOT placeable (substring traps). */
+const NON_BLOCK_TRAPS = new Set([
+  "redstone", "glowstone_dust", "ender_pearl", "blaze_rod", "breeze_rod", "bone",
+  "nether_wart", "wheat", "honey_bottle", "dragon_breath", "fire_charge", "snowball",
+]);
+
+/** Is an item stack placeable as a block (not air/tool/weapon/armor/food)?
+ *  Token-aware: "oak_log" must NOT be rejected because it contains the letters
+ *  "a-x-e"; tools/weapons match only on underscore-delimited tokens or exact
+ *  suffixes. Unknown items default to PLACEABLE (the real hotbar telemetry and
+ *  the placement material guard provide correctness; over-rejecting here was
+ *  why the bot stopped placing valid blocks entirely). */
 export function isPlaceableBlockItem(itemRaw: any): boolean {
   const s = String(itemRaw?.item ?? itemRaw ?? "").toLowerCase().replace(/^minecraft:/, "");
   if (!s || s === "air") return false;
+  if (NON_BLOCK_TRAPS.has(s)) return false;
   if (typeof itemRaw?.isBlock === "boolean") return itemRaw.isBlock;
-  if (/pickaxe|sword|shovel|hoe|bow|crossbow|shield|helmet|chestplate|leggings|boots|elytra|apple|bread|meat|cooked|potion|bucket|tnt|flint_and_steel|shears|fishing_rod/.test(s) && !/_planks|_log|_slab|_stairs|torch/.test(s)) return false;
-  if (s === "stick" || s.endsWith("_axe") || s.endsWith("_sword")) return false;
+  const toks = s.split(/[^a-z0-9]+/).filter(Boolean);
+  const toolTok = ["pickaxe", "axe", "shovel", "hoe", "shears", "brush"];
+  const weaponTok = ["sword", "bow", "trident", "mace", "crossbow", "shield"];
+  const armorTok = ["helmet", "chestplate", "leggings", "boots", "elytra"];
+  const foodTok = ["apple", "bread", "beef", "porkchop", "mutton", "chicken", "stew", "soup", "cookie", "cake"];
+  const last = toks[toks.length - 1] || "";
+  if (toolTok.includes(last) || toolTok.includes(s)) return false;
+  if (weaponTok.includes(last) || weaponTok.includes(s)) return false;
+  if (armorTok.includes(last) || armorTok.includes(s)) return false;
+  if (s === "fishing_rod" || s === "flint_and_steel" || s === "clock" || s === "compass" || s === "map" || s === "stick" || s === "string" || s === "feather") return false;
+  if (s.endsWith("_bucket") || s.endsWith("_potion") || s.startsWith("potion") || s.endsWith("_boat") || s.endsWith("_minecart") || s.endsWith("_seeds") || s.endsWith("_spawn_egg") || s.startsWith("music_disc") || s.endsWith("_ingot") || s.endsWith("_shard")) return false;
+  // Food heuristic only for clearly-edible names (never matches "_cooked_-anything" blocks)
+  if (foodTok.some((t) => toks.includes(t))) return false;
   return true;
 }

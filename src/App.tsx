@@ -1586,6 +1586,19 @@ export default function App() {
       }
 
       if (!actualHeldItem) {
+        // When live bridge telemetry reports an EMPTY/unknown hotbar we cannot know
+        // what the hand holds - previously this denied EVERY placement ("not placing
+        // blocks anymore"). The in-game bridge itself refuses to place air, so pass
+        // through and let the server-side material guard + game logic decide.
+        const hbKnown = (currentP.hotbar || []).some((st: any) => st && st.item && st.item !== "minecraft:air" && (st.count ?? 1) > 0);
+        if (isConnected && !hbKnown) {
+          sendActionToBridge({
+            type: "place_block", x: targetX, y: targetY, z: targetZ,
+            hand: action.hand || "main", side: action.side || "up",
+            slot: activeSlot, agentId: targetAgentId,
+          });
+          return;
+        }
         setThoughtLog((t) => [
           `[Placement Denied]: Slot ${activeSlot} is empty or air! Cannot place block at [${targetX}, ${targetY}, ${targetZ}].`,
           ...t.slice(0, 30),
