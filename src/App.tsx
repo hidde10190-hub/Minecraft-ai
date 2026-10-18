@@ -435,6 +435,123 @@ export default function App() {
   // Gates scans/autonomy so the AI never acts on stale or simulated coordinates.
   const lastLiveTelemetryAtRef = useRef<number>(0);
   const navigateStateRef = useRef<{ lastX: number; lastY: number; lastZ: number; lastTime: number }>({ lastX: 0, lastY: 0, lastZ: 0, lastTime: 0 });
+  // Always-fresh mirror of the player state for async loops (navigation) that must
+  // read live telemetry positions without stale closure captures.
+  const playerRef = useRef<any>(null);
+  useEffect(() => { playerRef.current = player; }, [player]);
+
+  // ==========================================
+  // CLOSED-LOOP NAVIGATION (real movement, not thousands of micro-taps)
+  // ==========================================
+  // Holds W DOWN until the bot has actually arrived at the destination (verified by
+  // live telemetry position), instead of firing short press_key w pulses each cycle.
+  const navLoopRef = useRef<{
+    timer: ReturnType<typeof setInterval> | null;
+    targetX: number;
+    targetZ: number;
+    arriveRadius: number;
+    agentId?: string;
+    sprint: boolean;
+    lastX: number;
+    lastZ: number;
+    stuckTicks: number;
+    elapsedMs: number;
+    maxMs: number;
+  } | null>(null);
+
+  const stopNavigationLoop = () => {
+    const loop = navLoopRef.current;
+    if (!loop) return;
+    if (loop.timer) clearInterval(loop.timer);
+    sendActionToBridge({ type: "release_key", key: "w", agentId: loop.agentId } as any);
+    sendActionToBridge({ type: "release_key", key: "sprint", agentId: loop.agentId } as any);
+    navLoopRef.current = null;
+  };
+
+  const startNavigationLoop = (targetX: number, targetZ: number, opts: { arriveRadius?: number; agentId?: string; sprint?: boolean } = {}) => {
+    // Re-plan in place when a navigation is already running - never release/re-press
+    // (that tap-cycle was what made walking look like stuttering).
+    if (navLoopRef.current?.timer) {
+      navLoopRef.current.targetX = targetX;
+      navLoopRef.current.targetZ = targetZ;
+      navLoopRef.current.arriveRadius = opts.arriveRadius ?? navLoopRef.current.arriveRadius;
+      navLoopRef.current.elapsedMs = 0;
+      navLoopRef.current.stuckTicks = 0;
+      const np0 = playerRef.current || player;
+      navLoopRef.current.maxMs = Math.min(20000, Math.max(1500, Math.round((Math.hypot(targetX - np0.x, targetZ - np0.z) / 4.3) * 1000) + 2500));
+      return;
+    }
+    const p = playerRef.current || player;
+    const dist = Math.hypot(targetX - p.x, targetZ - p.z);
+    const loop = {
+      timer: null as ReturnType<typeof setInterval> | null,
+      targetX,
+      targetZ,
+      arriveRadius: opts.arriveRadius ?? 0.9,
+      agentId: opts.agentId,
+      sprint: opts.sprint !== false && dist > 3.5,
+      lastX: p.x,
+      lastZ: p.z,
+      stuckTicks: 0,
+      elapsedMs: 0,
+      maxMs: Math.min(20000, Math.max(1500, Math.round((dist / 4.3) * 1000) + 2500)),
+    };
+    navLoopRef.current = loop;
+
+    // Face the destination first; then hold W indefinitely (-1 = hold until release).
+    const faceYaw = ((((Math.atan2(-(targetX - p.x), targetZ - p.z) * 180) / Math.PI) % 360) + 360) % 360;
+    sendActionToBridge({ type: "look_at", x: targetX, y: (p.y ?? 0) + 0.5, z: targetZ, yaw: Math.round(faceYaw * 10) / 10, pitch: 0, ticks: 4, agentId: opts.agentId } as any);
+
+    loop.timer = setInterval(() => {
+      const cur = navLoopRef.current;
+      if (!cur?.timer) return;
+      const np = playerRef.current || player;
+      const dx = cur.targetX - np.x;
+      const dz = cur.targetZ - np.z;
+      const horiz = Math.hypot(dx, dz);
+      cur.elapsedMs += 250;
+
+      // Arrived, timed out, or bridge telemetry went stale -> stop cleanly.
+      if (horiz <= cur.arriveRadius || cur.elapsedMs > cur.maxMs || Date.now() - lastLiveTelemetryAtRef.current > 6000) {
+        setThoughtLog((t) => [`[Navigation]: ${horiz <= cur.arriveRadius ? `Arrived at [${Math.round(cur.targetX)}, ${Math.round(cur.targetZ)}] (${horiz.toFixed(1)}m off target).` : `Navigation stopped (timeout/stale link, ${horiz.toFixed(1)}m from target).`}`, ...t.slice(0, 30)]);
+        stopNavigationLoop();
+        return;
+      }
+
+      // Stuck detection: <8cm progress over ~1s -> jump + strafe around the obstacle.
+      const moved = Math.hypot(np.x - cur.lastX, np.z - cur.lastZ);
+      if (moved < 0.08) {
+        cur.stuckTicks++;
+        if (cur.stuckTicks >= 4) {
+          cur.stuckTicks = 0;
+          sendActionToBridge({ type: "press_key", key: "space", durationMs: 250, agentId: cur.agentId } as any);
+          sendActionToBridge({ type: "press_key", key: Math.random() > 0.5 ? "a" : "d", durationMs: 400, agentId: cur.agentId } as any);
+        }
+      } else {
+        cur.stuckTicks = 0;
+      }
+      cur.lastX = np.x;
+      cur.lastZ = np.z;
+
+      // Continuously re-aim so the path stays straight toward the target.
+      const yaw = ((((Math.atan2(-dx, dz) * 180) / Math.PI) % 360) + 360) % 360;
+      sendActionToBridge({ type: "set_rotation", yaw: Math.round(yaw * 10) / 10, pitch: 0, agentId: cur.agentId } as any);
+
+      // Refresh the indefinite holds once per second only (guards against packet loss
+      // or stray release_all_keys). The key is NEVER released between refreshes, so
+      // Minecraft sees one continuous W hold = smooth real walking.
+      if (cur.elapsedMs % 1000 < 250) {
+        sendActionToBridge({ type: "press_key", key: "w", durationMs: -1, agentId: cur.agentId } as any);
+        if (cur.sprint) sendActionToBridge({ type: "press_key", key: "sprint", durationMs: -1, agentId: cur.agentId } as any);
+      }
+    }, 250);
+
+    // Kick off the continuous hold immediately.
+    sendActionToBridge({ type: "press_key", key: "w", durationMs: -1, agentId: opts.agentId } as any);
+    if (loop.sprint) sendActionToBridge({ type: "press_key", key: "sprint", durationMs: -1, agentId: opts.agentId } as any);
+  };
+
+  useEffect(() => () => stopNavigationLoop(), []);
 
   // Fresh live position (telemetry within the last 15s) — authoritative source for scans.
   const hasLivePosition = Date.now() - lastLiveTelemetryAtRef.current < 15000;
@@ -1347,7 +1464,11 @@ export default function App() {
     } else if (action.type === "select_hotbar") {
       if (action.slot !== undefined) {
         const targetSlot = Math.max(0, Math.min(8, action.slot));
-        setPlayer((p) => ({ ...p, selectedSlot: targetSlot }));
+        // OPTIMISTIC local state is only valid OFFLINE. When a live bridge is connected
+        // the REAL hotbar (and held item) comes from the game's telemetry packets -
+        // trusting stale/empty local state here made placements validate against items
+        // the bot does not actually hold (e.g. air/hand or an axe).
+        setPlayer((p) => (isConnected ? p : { ...p, selectedSlot: targetSlot }));
         setAgents((prev) =>
           prev.map((ag) =>
             ag.id === targetAgentId
@@ -1454,15 +1575,51 @@ export default function App() {
       // Actual Game Information: verify what is ACTUALLY held in the active hand
       const activeSlot = action.slot !== undefined ? Math.max(0, Math.min(8, Number(action.slot))) : (currentP.selectedSlot ?? 0);
       const heldStack = currentP.hotbar?.[activeSlot];
-      const actualHeldItem = (heldStack && heldStack.count > 0 && heldStack.item && heldStack.item !== "minecraft:air")
+      let actualHeldItem = (heldStack && heldStack.count > 0 && heldStack.item && heldStack.item !== "minecraft:air")
         ? heldStack.item
         : null;
+      // Ground truth from the live bridge beats local guesswork: main_hand / held item.
+      if (!actualHeldItem && isConnected) {
+        const mg = (currentP as any).mainHand || (currentP as any).main_hand || (currentP as any).heldItem;
+        const mgItem = typeof mg === "string" ? mg : mg?.item;
+        if (mgItem && String(mgItem).toLowerCase() !== "minecraft:air") actualHeldItem = String(mgItem);
+      }
 
       if (!actualHeldItem) {
         setThoughtLog((t) => [
           `[Placement Denied]: Slot ${activeSlot} is empty or air! Cannot place block at [${targetX}, ${targetY}, ${targetZ}].`,
           ...t.slice(0, 30),
         ]);
+        return;
+      }
+
+      // WRONG-MATERIAL GUARD: if this placement targets a schematic cell that expects a
+      // specific block, never place a different one (this was the "oak logs counted as
+      // stone bricks" family of bugs - a mismatched stack silently filled brick cells).
+      const expectedCell = (diffs || []).find(
+        (d: any) => d && Math.floor(Number(d.x)) === targetX && Math.floor(Number(d.y)) === targetY && Math.floor(Number(d.z)) === targetZ && d.expectedBlock
+      );
+      if (expectedCell && !isExactBlockMatch(actualHeldItem, expectedCell.expectedBlock) &&
+          !blockNamesCompatible(String(actualHeldItem).replace(/^minecraft:/, ""), String(expectedCell.expectedBlock).replace(/^minecraft:/, ""))) {
+        // Try to re-point at a hotbar slot that DOES hold the expected material.
+        const correctSlot = (currentP.hotbar || []).findIndex((s: any) =>
+          s && s.count > 0 && s.item && isExactBlockMatch(s.item, expectedCell.expectedBlock));
+        if (correctSlot >= 0) {
+          setPlayer((p) => ({ ...p, selectedSlot: correctSlot }));
+          sendActionToBridge({ type: "select_hotbar", slot: correctSlot, agentId: targetAgentId });
+          sendActionToBridge({
+            type: "place_block", x: targetX, y: targetY, z: targetZ,
+            hand: action.hand || "main", side: action.side || "up",
+            block: currentP.hotbar[correctSlot].item, slot: correctSlot, agentId: targetAgentId,
+          });
+          worldVoxelMapRef.current.set(`${targetX},${targetY},${targetZ}`, currentP.hotbar[correctSlot].item);
+          setDiffs((prev) => prev.map((d) => (d === expectedCell ? { ...d, type: "CORRECT", currentBlock: currentP.hotbar[correctSlot].item } : d)));
+        } else {
+          setThoughtLog((t) => [
+            `[Placement Blocked]: Holding ${actualHeldItem.replace(/^minecraft:/, "")} but [${targetX}, ${targetY}, ${targetZ}] requires ${String(expectedCell.expectedBlock).replace(/^minecraft:/, "")}. No matching stack in hotbar - refusing to place wrong block.`,
+            ...t.slice(0, 30),
+          ]);
+        }
         return;
       }
 
@@ -1846,7 +2003,18 @@ export default function App() {
       if (foundSlot !== -1) {
         slotToUse = foundSlot;
       } else {
-        // Restock hotbar with the EXACT expected schematic block (no cobblestone instead of stone)
+        // Restock hotbar ONLY in offline simulation. Against a live bridge we must NOT
+        // fabricate stacks locally - that desyncs the UI from the real inventory and the
+        // bot then "places" items it does not actually hold (hand/axe symptom). When the
+        // exact material is missing, ask the bridge to equip it and skip this placement.
+        if (isConnected) {
+          handleDispatchAction({ type: "equip_item", item: expected });
+          setThoughtLog((t) => [
+            `[Restock Needed]: '${String(expected).replace(/^minecraft:/, "")}' not in real hotbar for [${target.x}, ${target.y}, ${target.z}] - requested equip, skipping placement.`,
+            ...t.slice(0, 30),
+          ]);
+          return;
+        }
         const emptySlot = player.hotbar.findIndex((s) => !s.item || s.item === "minecraft:air" || s.count === 0);
         slotToUse = emptySlot !== -1 ? emptySlot : (player.selectedSlot < 7 ? player.selectedSlot : 0);
         setPlayer((p) => {
@@ -1905,18 +2073,23 @@ export default function App() {
     setMaterials(design.materials);
     setCurrentPreset("ai_custom_house");
 
-    // Equip active builder's hotbar with all varied schematic materials
-    const uniqueBlocks = Array.from(new Set(design.blocks.map((b) => b.block)));
-    setPlayer((p) => {
-      const newHb = [...p.hotbar];
-      for (let i = 0; i < Math.min(7, uniqueBlocks.length); i++) {
-        newHb[i] = { slot: i, item: uniqueBlocks[i], count: 64 };
-      }
-      // Guarantee temporary scaffolding in slot 7
-      newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
-      newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
-      return { ...p, hotbar: newHb };
-    });
+    // Equip active builder's hotbar with all varied schematic materials.
+    // OFFLINE SIMULATION ONLY: against a live bridge, fabricating 64x stacks locally
+    // makes every planner believe the bot holds materials it doesn't - it then selects
+    // those fake slots and places whatever is REALLY in slot 0 (hand/axe/wrong block).
+    if (!isConnected) {
+      const uniqueBlocks = Array.from(new Set(design.blocks.map((b) => b.block)));
+      setPlayer((p) => {
+        const newHb = [...p.hotbar];
+        for (let i = 0; i < Math.min(7, uniqueBlocks.length); i++) {
+          newHb[i] = { slot: i, item: uniqueBlocks[i], count: 64 };
+        }
+        // Guarantee temporary scaffolding in slot 7
+        newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
+        newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
+        return { ...p, hotbar: newHb };
+      });
+    }
 
     setThoughtLog((prev) => [
       `[AI House Architect]: Successfully designed "${design.name}" [${design.engineUsed}] (${design.dimensions.width}x${design.dimensions.length}x${design.dimensions.height}, ${design.blocks.length} blocks, ${design.materials.length} material types).`,
@@ -1941,17 +2114,25 @@ export default function App() {
       }))
     );
 
-    // Populate active agent's hotbar with active schematic materials
-    setPlayer((p) => {
-      const newHb = [...p.hotbar];
-      const needed = materials.filter((m) => m.item !== "minecraft:air").map((m) => m.item);
-      for (let i = 0; i < Math.min(7, needed.length); i++) {
-        newHb[i] = { slot: i, item: needed[i], count: 64 };
-      }
-      newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
-      newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
-      return { ...p, hotbar: newHb };
-    });
+    // Populate active agent's hotbar with active schematic materials (offline sim only -
+    // never fabricate stacks against a live bridge; real inventory is ground truth).
+    if (!isConnected) {
+      setPlayer((p) => {
+        const newHb = [...p.hotbar];
+        const needed = materials.filter((m) => m.item !== "minecraft:air").map((m) => m.item);
+        for (let i = 0; i < Math.min(7, needed.length); i++) {
+          newHb[i] = { slot: i, item: needed[i], count: 64 };
+        }
+        newHb[7] = { slot: 7, item: "minecraft:scaffolding", count: 64 };
+        newHb[8] = { slot: 8, item: "minecraft:diamond_pickaxe", count: 1 };
+        return { ...p, hotbar: newHb };
+      });
+    } else {
+      setThoughtLog((prev) => [
+        `[Auto Material Gatherer]: Live bridge connected - reading REAL inventory instead of simulated restock. Missing materials will be reported, not fabricated.`,
+        ...prev,
+      ]);
+    }
 
     setThoughtLog((prev) => [
       `[Auto Material Gatherer]: Successfully gathered and restocked all missing building materials & scaffolding into player hotbar!`,

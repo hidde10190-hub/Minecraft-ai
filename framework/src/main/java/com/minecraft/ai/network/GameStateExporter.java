@@ -927,9 +927,16 @@ public class GameStateExporter {
                     int durationTicks = 1;
                     if (json.has("duration_ticks")) {
                         durationTicks = json.get("duration_ticks").getAsInt();
+                    } else if (json.has("durationMs")) {
+                        // The web dashboard sends camelCase durationMs - previously this
+                        // field was ignored and every press collapsed to 1 tick (~50ms),
+                        // which is why "walking" looked like tapping W for a few
+                        // milliseconds thousands of times.
+                        int ms = json.get("durationMs").getAsInt();
+                        durationTicks = ms < 0 ? -1 : Math.max(1, Math.round(ms / 50.0f));
                     } else if (json.has("duration_ms")) {
                         int ms = json.get("duration_ms").getAsInt();
-                        durationTicks = ms < 0 ? -1 : Math.max(1, ms / 50);
+                        durationTicks = ms < 0 ? -1 : Math.max(1, Math.round(ms / 50.0f));
                     } else if (json.has("hold") && json.get("hold").getAsBoolean()) {
                         durationTicks = -1;
                     }

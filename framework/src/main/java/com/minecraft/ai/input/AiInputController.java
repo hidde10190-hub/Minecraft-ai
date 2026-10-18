@@ -158,21 +158,42 @@ public class AiInputController {
         }
 
         // 3. Process key hold timers with human-like release & press states
-        activeKeyHoldTicks.forEach((keyName, remainingTicks) -> {
+        // Collect first, mutate after: re-entrant put/remove during iteration could
+        // silently drop holds (the W key getting released early was part of the
+        // micro-tap walking symptom).
+        java.util.List<String> expiredKeys = null;
+        Map<String, Integer> decrementHoldTicks = null;
+        for (java.util.Map.Entry<String, Integer> e : activeKeyHoldTicks.entrySet()) {
+            String keyName = e.getKey();
+            int remainingTicks = e.getValue();
             KeyMapping kb = resolveKeyBinding(client, keyName);
-            if (kb != null) {
-                if (remainingTicks < 0) {
-                    // Indefinite hold until explicit release
-                    setKeyPressed(kb, true);
-                } else if (remainingTicks > 0) {
-                    setKeyPressed(kb, true);
-                    activeKeyHoldTicks.put(keyName, remainingTicks - 1);
-                } else {
-                    setKeyPressed(kb, false);
-                    activeKeyHoldTicks.remove(keyName);
-                }
+            if (kb == null) continue;
+            if (remainingTicks < 0) {
+                // Indefinite hold until explicit release
+                setKeyPressed(kb, true);
+            } else if (remainingTicks > 1) {
+                setKeyPressed(kb, true);
+                if (decrementHoldTicks == null) decrementHoldTicks = new java.util.HashMap<>();
+                decrementHoldTicks.put(keyName, remainingTicks - 1);
+            } else {
+                // Final tick: keep the key DOWN for this tick, release next tick.
+                // (Previously it released immediately, making every N-tick hold one
+                // tick shorter and short holds effectively taps.)
+                setKeyPressed(kb, true);
+                if (expiredKeys == null) expiredKeys = new java.util.ArrayList<>();
+                expiredKeys.add(keyName);
             }
-        });
+        }
+        if (decrementHoldTicks != null) {
+            decrementHoldTicks.forEach((k, v) -> activeKeyHoldTicks.put(k, v));
+        }
+        if (expiredKeys != null) {
+            for (String keyName : expiredKeys) {
+                KeyMapping kb = resolveKeyBinding(client, keyName);
+                if (kb != null) setKeyPressed(kb, false);
+                activeKeyHoldTicks.remove(keyName);
+            }
+        }
 
         // 4. Human Locomotion Enhancements (Natural Strafe & W-Tap Resets)
         if (humanKinematicsEnabled && player.isSprinting() && activeKeyHoldTicks.containsKey("forward")) {
@@ -298,7 +319,21 @@ public class AiInputController {
             KeyMapping kb = resolveKeyBinding(client, keyName);
             if (kb != null) {
                 setKeyPressed(kb, true);
-                activeKeyHoldTicks.put(keyName.toLowerCase(), Math.max(1, durationTicks));
+                String k = keyName.toLowerCase().trim();
+                // Sprint is a MODIFIER that must stay held for the whole duration of a
+                // combined movement (e.g. sprint + W). Previously it expired on its own
+                // timer and re-toggled every cycle, producing jittery micro-sprints.
+                // Auto-extend it while the forward key is still being held.
+                if ((k.equals("sprint") || k.equals("ctrl") || k.equals("left_ctrl")) && durationTicks > 0) {
+                    Integer fwd = activeKeyHoldTicks.get("forward");
+                    if (fwd == null) fwd = activeKeyHoldTicks.get("w");
+                    if (fwd != null) {
+                        int extended = fwd < 0 ? -1 : Math.max(durationTicks, fwd + 4);
+                        activeKeyHoldTicks.put(k, extended);
+                        return;
+                    }
+                }
+                activeKeyHoldTicks.put(k, Math.max(1, durationTicks));
             }
         });
     }
