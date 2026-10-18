@@ -34,6 +34,8 @@ import { loadSavedEnvConfig, persistEnvConfig, fetchServerEnvConfig } from "./ut
 import { evaluateMessageForSwarm } from "./utils/signAndMessageIntelligence";
 import { CognitiveFeedbackEngine } from "./utils/cognitiveFeedbackEngine";
 import { designAiHouse } from "./utils/aiHouseArchitect";
+import { blockNamesCompatible, normalizeBlockId, isExactBlockMatch, isPlaceableBlockItem } from "./utils/blockMatch";
+import { buildMemoryBriefingLocal, noteResourceSightingLocal, recordJournalLocal, noteProjectDoneLocal, noteLessonLocal, pullMemoryFromServer, syncMemoryToServer, rememberLandmarkLocal, noteHazardLocal } from "./utils/worldMemory";
 import { 
   PlayerState, 
   RaycastTarget, 
@@ -425,6 +427,10 @@ export default function App() {
 
   // Fresh live position (telemetry within the last 15s) — authoritative source for scans.
   const hasLivePosition = Date.now() - lastLiveTelemetryAtRef.current < 15000;
+
+  // Always-fresh view of `player` for timers/callbacks that must not capture a stale closure.
+  const playerRef = useRef<any>(null);
+  useEffect(() => { playerRef.current = player; }, [player]);
 
   const sendActionToBridge = (action: ActionPacket, port?: number) => {
     // Rule: The bot must not send chat messages on its own. Only when you ask it to do something!
