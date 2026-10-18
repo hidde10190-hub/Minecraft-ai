@@ -1,0 +1,57 @@
+# ==============================================================================
+# Override voor draaien naast een BESTAANDE Minecraft-server (geen eigen server)
+# ==============================================================================
+# Gebruik (vanuit de repo-root):
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+#
+# - De meegeleverde test-server (minecraft-server) en de Mineflayer-container
+#   (minecraft-bot, botst op poort 6080/5900) staan achter een profiel en starten niet.
+# - De Fabric-client verbindt met MINECRAFT_SERVER (standaard
+#   host.docker.internal:25565 = de poort die de bestaande server op de host publiceert).
+# - Poorten zijn NIET publiek: alleen 127.0.0.1 en het Tailscale-IP (TS_IP).
+#   Dashboard en VNC hebben nog geen inlog -- houd ze op het tailnet.
+# - Het dashboard (server.ts) draait als eigen container en vindt de client-bridge via
+#   BRIDGE_HOST=minecraft-fabric-standalone.
+# Zet TS_IP / MINECRAFT_SERVER / BOT_NAME in een lokale .env (staat in .gitignore).
+# ==============================================================================
+services:
+  minecraft-server:
+    profiles: ["local-server"]
+
+  minecraft-bot:
+    profiles: ["mineflayer"]
+    depends_on: !reset null
+
+  minecraft-standalone-client:
+    depends_on: !reset null
+    ports: !override
+      - "127.0.0.1:6080:6080"
+      - "${TS_IP:?zet TS_IP (Tailscale-IP) in .env}:6080:6080"
+
+  dashboard:
+    image: node:22-bookworm
+    container_name: minecraft-ai-dashboard
+    working_dir: /app
+    restart: unless-stopped
+    env_file:
+      - config.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - BRIDGE_HOST=minecraft-fabric-standalone
+      - VNC_WS_PORT=6080
+    volumes:
+      - ./:/app
+      - dashboard_node_modules:/app/node_modules
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "${TS_IP:?zet TS_IP (Tailscale-IP) in .env}:3000:3000"
+    command: >
+      sh -c "npm ci --ignore-scripts --no-audit --no-fund &&
+             npm run build &&
+             exec node dist/server.cjs"
+    depends_on:
+      - minecraft-standalone-client
+
+volumes:
+  dashboard_node_modules:
