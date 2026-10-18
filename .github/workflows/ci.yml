@@ -51,9 +51,9 @@ jobs:
         run: |
           set +e
           JAR=$(find . "$HOME/.gradle" -name 'minecraft-merged*.jar' ! -name '*sources*' 2>/dev/null | head -1)
-          echo "jar: $JAR"
-          unzip -l "$JAR" | grep -E 'SwingAnimation|/Prediction|DropPrediction' | awk '{print $4}' | head
-          for c in net.minecraft.client.player.LocalPlayer net.minecraft.world.entity.LivingEntity net.minecraft.world.entity.player.Player; do
-            echo "== $c"; javap -cp "$JAR" -public "$c" | grep -E ' (drop|swing|dropSelectedItem)\(' || true; done
-          for f in $(unzip -l "$JAR" | grep -E 'SwingAnimation|/Prediction' | awk '{print $4}' | sed 's/\.class$//; s#/#.#g' | head -4); do
-            echo "== $f"; javap -cp "$JAR" -public "$f" | head -20 ; done
+          for c in net.minecraft.client.player.LocalPlayer net.minecraft.world.entity.player.Player net.minecraft.world.entity.LivingEntity net.minecraft.world.entity.Entity net.minecraft.client.multiplayer.MultiPlayerGameMode net.minecraft.world.entity.player.Inventory; do
+            echo "== $c (swing|drop)"; javap -cp "$JAR" -public "$c" | grep -i -E 'swing|drop' ; done
+          for c in net.minecraft.world.item.component.SwingAnimation net.minecraft.world.item.SwingAnimationType; do
+            echo "== $c"; javap -cp "$JAR" -public "$c" | head -25 ; done
+          echo "== DataComponents SWING"; javap -cp "$JAR" -public net.minecraft.core.component.DataComponents | grep -i swing
+          echo "== ServerboundPlayerActionPacket.Action"; javap -cp "$JAR" -public 'net.minecraft.network.protocol.game.ServerboundPlayerActionPacket$Action' | grep -i -E 'drop'
