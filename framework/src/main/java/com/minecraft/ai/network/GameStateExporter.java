@@ -187,7 +187,13 @@ public class GameStateExporter {
             });
 
             // REST Endpoints
-            this.server.get("/api/state", ctx -> {
+            // Live export of every built-in crafting recipe from the game's own RecipeManager.
+        this.server.get("/api/recipes", ctx -> {
+            ctx.contentType("application/json");
+            ctx.result(AiInputController.getInstance().exportAllRecipesJson());
+        });
+
+        this.server.get("/api/state", ctx -> {
                 Minecraft client = Minecraft.getInstance();
                 if (client.player == null || client.level == null) {
                     ctx.status(503).result("{\"error\": \"Player or world is null. Client not in active game.\"}");
@@ -206,7 +212,14 @@ public class GameStateExporter {
             });
 
             this.server.get("/api/status", ctx -> {
-                ctx.result(AutoConnectHandler.getStatusJson().toString());
+                JsonObject status = AutoConnectHandler.getStatusJson();
+                // Endpoint discovery hint for AI agents / dashboards.
+                status.addProperty("hint", "GET /api/state (telemetry), GET /api/recipes (all built-in crafting recipes), POST ws action packets: move_slot, move_to_hotbar, equip_item, craft");
+                status.add("endpoints", GSON.toJsonTree(new String[] {
+                        "/api/state", "/api/recipes", "/api/status", "/api/chat", "/api/cube-map", "/ws"
+                }));
+                ctx.contentType("application/json");
+                ctx.result(status.toString());
             });
 
             this.server.get("/api/chat", ctx -> {
@@ -949,6 +962,77 @@ public class GameStateExporter {
                 case "select_hotbar" -> {
                     int slot = json.get("slot").getAsInt();
                     controller.selectHotbarSlot(slot);
+                }
+                case "swap_inventory_to_hotbar" -> {
+                    // Legacy alias: move an item (by id, or the first non-empty main slot if omitted)
+                    // into a hotbar slot. Handled by the same inventory-move engine as move_to_hotbar.
+                    String itemId = json.has("item") ? json.get("item").getAsString() : null;
+                    int hotbarSlot = json.has("slot") ? json.get("slot").getAsInt()
+                            : (json.has("to_slot") ? json.get("to_slot").getAsInt() : 0);
+                    boolean swap = !json.has("swap") || json.get("swap").getAsBoolean();
+                    if (itemId != null) {
+                        controller.moveItemToHotbar(itemId, hotbarSlot, swap);
+                    } else {
+                        // No item specified: find the first non-empty main-inventory slot and move it.
+                        Minecraft mcSwap = Minecraft.getInstance();
+                        if (mcSwap.player != null) {
+                            for (int i = 9; i < 36; i++) {
+                                if (!mcSwap.player.getInventory().items.get(i).isEmpty()) {
+                                    controller.moveInventorySlot(i, hotbarSlot, swap);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                case "move_slot", "move_item" -> {
+                    // Move an item stack between player inventory slots (e.g. main -> hotbar)
+                    int from = json.get("from_slot").getAsInt();
+                    int to = json.get("to_slot").getAsInt();
+                    boolean swap = !json.has("swap") || json.get("swap").getAsBoolean();
+                    controller.moveInventorySlot(from, to, swap);
+                }
+                case "move_to_hotbar" -> {
+                    // Find an item by id anywhere in the main inventory and move it to a hotbar slot
+                    String itemId = json.get("item").getAsString();
+                    int hotbarSlot = json.has("slot") ? json.get("slot").getAsInt() : 0;
+                    boolean swap = !json.has("swap") || json.get("swap").getAsBoolean();
+                    controller.moveItemToHotbar(itemId, hotbarSlot, swap);
+                }
+                case "equip_item" -> {
+                    String itemId = json.get("item").getAsString();
+                    controller.equipItem(itemId);
+                }
+                case "craft" -> {
+                    // Craft any recipe using the game's BUILT-IN recipe book (RecipeManager).
+                    // Accepts either a vanilla recipe id ("minecraft:chest") or a result item id.
+                    String recipe = json.has("recipe") ? json.get("recipe").getAsString()
+                            : (json.has("item") ? json.get("item").getAsString() : null);
+                    if (recipe != null) {
+                        String resolved = recipe;
+                        if (!recipe.contains(":")) resolved = "minecraft:" + recipe;
+                        // If given an item id that isn't itself a recipe id, look up a crafting
+                        // recipe whose result matches that item via the exported built-in list.
+                        if (!resolved.startsWith("minecraft:") || true) {
+                            String allJson = controller.exportAllRecipesJson();
+                            JsonArray recipes = GSON.fromJson(allJson, JsonArray.class);
+                            boolean directHit = false;
+                            for (var el : recipes) {
+                                if (el.getAsJsonObject().get("id").getAsString().equals(resolved)) { directHit = true; break; }
+                            }
+                            if (!directHit) {
+                                for (var el : recipes) {
+                                    JsonObject r = el.getAsJsonObject();
+                                    if (r.has("result_item") && r.get("result_item").getAsString().equals(resolved)) {
+                                        resolved = r.get("id").getAsString();
+                                        directHit = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        controller.craftRecipeById(resolved);
+                    }
                 }
                 case "place_block" -> {
                     InteractionHand hand = json.has("hand") && "off".equalsIgnoreCase(json.get("hand").getAsString())

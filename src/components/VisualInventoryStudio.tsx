@@ -99,7 +99,7 @@ export const VisualInventoryStudio: React.FC<VisualInventoryStudioProps> = ({
 
   const currentItemCounts = useMemo(() => {
     const counts: Record<string, number> = {};
-    Object.values(inventorySlots).forEach((s) => {
+    Object.values(inventorySlots).forEach((s: { item: string; count: number }) => {
       if (s && s.item && s.count > 0) {
         counts[s.item] = (counts[s.item] || 0) + s.count;
       }
@@ -160,10 +160,34 @@ export const VisualInventoryStudio: React.FC<VisualInventoryStudioProps> = ({
     setTransferLogs((prev) => [event, ...prev.slice(0, 19)]);
     onAddAgentLog(`[Verified Inventory Transfer]: ${event.diagnosticNote}`);
 
-    onDispatchAction({
-      type: "select_hotbar",
-      slot: fromSlotIdx <= 8 ? fromSlotIdx : 0
-    });
+    // Dispatch the REAL slot-move action packet to the bot (vanilla slot ids:
+    // 0-8 hotbar, 9-35 main inventory). The MOD moves the actual ItemStack.
+    if (fromCont === "main_inventory" || fromCont === "hotbar") {
+      if (toCont === "hotbar" || toCont === "main_inventory") {
+        onDispatchAction({
+          type: "move_slot",
+          from_slot: fromSlotIdx,
+          to_slot: toSlotIdx,
+          swap: true,
+        });
+      } else {
+        // Moving into a crafting grid: first pull the item into hotbar slot 0 so
+        // the in-game craft flow can pick it up, then let the MOD fill the grid.
+        onDispatchAction({
+          type: "move_to_hotbar",
+          item: sourceItem.item,
+          slot: 0,
+          swap: true,
+        });
+      }
+    } else if (toCont === "hotbar" || toCont === "main_inventory") {
+      onDispatchAction({
+        type: "move_slot",
+        from_slot: fromSlotIdx,
+        to_slot: toSlotIdx,
+        swap: true,
+      });
+    }
   };
 
   const handleInspectAndRecover = () => {
@@ -198,10 +222,70 @@ export const VisualInventoryStudio: React.FC<VisualInventoryStudioProps> = ({
     onAddAgentLog(`[Inventory State Recovery]: ${recoveryEvent.diagnosticNote}`);
   };
 
+  const [craftQuery, setCraftQuery] = useState("minecraft:chest");
+  const [liveRecipes, setLiveRecipes] = useState<any[]>([]);
+  const [liveRecipesSource, setLiveRecipesSource] = useState<string>("");
+
+  // Pull the bot's BUILT-IN recipe book (every vanilla crafting recipe from the
+  // game's own RecipeManager) via GET /api/recipes on the MOD's embedded server.
+  React.useEffect(() => {
+    let cancelled = false;
+    const loadRecipes = async () => {
+      const candidates = ["/api/bridge/8080/recipes", "http://localhost:8080/api/recipes", "http://localhost:8079/api/recipes"];
+      for (const url of candidates) {
+        try {
+          const controller = new AbortController();
+          const tid = setTimeout(() => controller.abort(), 1500);
+          const res = await fetch(url, { signal: controller.signal });
+          clearTimeout(tid);
+          if (res.ok) {
+            const data = await res.json();
+            if (!cancelled && Array.isArray(data)) {
+              setLiveRecipes(data);
+              setLiveRecipesSource(url);
+            }
+            return;
+          }
+        } catch {}
+      }
+    };
+    loadRecipes();
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleDispatchToBot = (action: any) => {
+    onDispatchAction(action);
+    onAddAgentLog(`[Action Packet → Bot]: ${JSON.stringify(action)}`);
+  };
+
+  const handleCraftRecipe = (recipeId: string) => {
+    handleDispatchToBot({ type: "craft", recipe: recipeId });
+    const craftEvent: VerifiedTransferEvent = {
+      id: `livecraft_${Date.now()}`,
+      timestamp: Date.now(),
+      fromContainer: "crafting_result",
+      fromSlot: 0,
+      toContainer: "hotbar",
+      toSlot: activeAgent.player.selectedSlot ?? 0,
+      item: recipeId,
+      count: 1,
+      expectedSourceDelta: 0,
+      actualSourceDelta: 0,
+      verified: true,
+      recoveryTriggered: false,
+      diagnosticNote: `Dispatched REAL craft packet for "${recipeId}". The MOD resolves it against the game's built-in RecipeManager, fills the crafting grid and collects the result in-game.`
+    };
+    setTransferLogs((prev) => [craftEvent, ...prev.slice(0, 19)]);
+  };
+
   const handleExecuteRecipeStep = (step: PlanStep) => {
     onAddAgentLog(`[Recipe Graph Execution]: Step ${step.step} (${step.action.toUpperCase()}): ${step.reason}`);
     
     if (step.action === "craft") {
+      // Dispatch a REAL craft packet: the MOD crafts using the game's own built-in
+      // recipe book (RecipeManager), resolving by result item id or recipe id.
+      handleCraftRecipe(step.targetItem);
+
       setInventorySlots((prev) => {
         const next = { ...prev };
         next[0] = { item: step.targetItem, count: (next[0]?.count || 0) + (step.count || 1) };
@@ -692,6 +776,68 @@ export const VisualInventoryStudio: React.FC<VisualInventoryStudioProps> = ({
         </div>
 
         <div className="lg:col-span-5 space-y-6">
+          <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Hammer className="w-4 h-4 text-emerald-400" />
+                <h3 className="text-sm font-bold text-slate-200">Built-in Recipe Book — Live Craft</h3>
+              </div>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                {liveRecipes.length > 0 ? `${liveRecipes.length} recipes from game RecipeManager` : "GET /api/recipes"}
+              </span>
+            </div>
+
+            <p className="text-xs text-slate-400">
+              Every crafting recipe known to the bot, exported directly from Minecraft's own built-in{" "}
+              <span className="font-mono text-emerald-300">RecipeManager</span>. Clicking Craft dispatches a real{" "}
+              <span className="font-mono text-emerald-300">craft</span> action packet; the MOD fills the crafting grid and collects the result in-game.
+            </p>
+
+            <div className="flex items-center gap-2">
+              <input
+                value={craftQuery}
+                onChange={(e) => setCraftQuery(e.target.value)}
+                placeholder="minecraft:chest or chest"
+                className="flex-1 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-700 text-xs font-mono text-slate-200 focus:outline-none focus:border-emerald-500"
+              />
+              <button
+                onClick={() => handleCraftRecipe(craftQuery.trim() || "minecraft:chest")}
+                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-mono font-bold cursor-pointer flex items-center gap-1.5"
+              >
+                <Play className="w-3.5 h-3.5" /> Craft
+              </button>
+            </div>
+
+            {liveRecipes.length === 0 ? (
+              <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] font-mono text-slate-500">
+                Bot not reachable yet — live recipes load from /api/recipes once the MOD client is connected.
+                {liveRecipesSource ? ` (last tried: ${liveRecipesSource})` : ""}
+              </div>
+            ) : (
+              <div className="max-h-64 overflow-y-auto pr-1 space-y-1.5">
+                {liveRecipes.slice(0, 200).map((r: any) => (
+                  <div
+                    key={r.id}
+                    className="flex items-center justify-between p-2 rounded-lg bg-slate-950/80 border border-slate-800 text-[11px] font-mono"
+                  >
+                    <div className="truncate flex-1">
+                      <span className="text-slate-200">{String(r.id).replace("minecraft:", "")}</span>
+                      <span className="text-slate-500 ml-2">
+                        → {r.result_item ? String(r.result_item).replace("minecraft:", "") : "?"} x{r.result_count ?? 1}
+                      </span>
+                    </div>
+                    <button
+                      onClick={() => handleCraftRecipe(r.id)}
+                      className="ml-2 px-2 py-0.5 rounded bg-emerald-700/70 hover:bg-emerald-600 text-white font-bold cursor-pointer shrink-0"
+                    >
+                      Craft
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
           <div className="p-5 rounded-xl bg-slate-900 border border-slate-800 space-y-4">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">

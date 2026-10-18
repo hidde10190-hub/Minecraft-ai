@@ -8,6 +8,7 @@ import { AiBrainConsole } from "./components/AiBrainConsole";
 import { CodeExplorer } from "./components/CodeExplorer";
 import { ProtocolDocs } from "./components/ProtocolDocs";
 import { StandaloneClientLauncher } from "./components/StandaloneClientLauncher";
+import BotScreenViewer from "./components/BotScreenViewer";
 import { LiveWorldMap } from "./components/LiveWorldMap";
 import { ChatTerminal } from "./components/ChatTerminal";
 import { ChatDashboard } from "./components/ChatDashboard";
@@ -3115,6 +3116,9 @@ STRICT JSON: {"thought": "...", "actions": [...]}`;
             }}
           />
         )}
+
+        {/* Tab: Live Bot Screen via noVNC (watch + directly control the bot's display) */}
+        {activeTab === "bot_screen" && <BotScreenViewer />}
 
         {/* Tab 2: In-Game Chat & Swarm Perception Dashboard */}
         {activeTab === "chat" && (

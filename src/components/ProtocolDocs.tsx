@@ -85,10 +85,41 @@ export const ProtocolDocs: React.FC<ProtocolDocsProps> = ({
                 <td className="py-2 px-3">Missing & misplaced schematic voxels sorted by distance to player.</td>
               </tr>
               <tr>
+                <td className="py-2 px-3 text-emerald-400 font-bold">GET</td>
+                <td className="py-2 px-3 text-slate-100 font-semibold">/api/recipes</td>
+                <td className="py-2 px-3 text-emerald-400">Java &rarr; Client</td>
+                <td className="py-2 px-3">Every built-in crafting recipe from the game's own RecipeManager (id, result item/count, grid ingredients).</td>
+              </tr>
+              <tr>
                 <td className="py-2 px-3 text-purple-400 font-bold">POST</td>
                 <td className="py-2 px-3 text-slate-100 font-semibold">/api/action</td>
                 <td className="py-2 px-3 text-purple-400">Client &rarr; Java</td>
                 <td className="py-2 px-3">Enqueues virtual keybinding or camera rotation packet onto game thread.</td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 text-purple-400 font-bold">WS</td>
+                <td className="py-2 px-3 text-slate-100 font-semibold">move_slot / move_to_hotbar</td>
+                <td className="py-2 px-3 text-purple-400">Client &rarr; Java</td>
+                <td className="py-2 px-3">
+                  Move a real ItemStack between player inventory slots. Vanilla slot ids: 0&ndash;8 hotbar, 9&ndash;35 main, 36&ndash;39 armor, 40 offhand.{" "}
+                  <span className="font-mono text-[10px]">{`{"type":"move_slot","from_slot":12,"to_slot":0,"swap":true}`}</span>{" "}
+                  or <span className="font-mono text-[10px]">{`{"type":"move_to_hotbar","item":"minecraft:diamond_pickaxe","slot":3}`}</span>.
+                </td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 text-purple-400 font-bold">WS</td>
+                <td className="py-2 px-3 text-slate-100 font-semibold">equip_item</td>
+                <td className="py-2 px-3 text-purple-400">Client &rarr; Java</td>
+                <td className="py-2 px-3">Equips an armor item by id into the correct armor slot, swapping the old piece back into the inventory. <span className="font-mono text-[10px]">{`{"type":"equip_item","item":"minecraft:diamond_chestplate"}`}</span></td>
+              </tr>
+              <tr>
+                <td className="py-2 px-3 text-purple-400 font-bold">WS</td>
+                <td className="py-2 px-3 text-slate-100 font-semibold">craft</td>
+                <td className="py-2 px-3 text-purple-400">Client &rarr; Java</td>
+                <td className="py-2 px-3">
+                  Crafts any recipe using the game's BUILT-IN recipe book. Accepts a recipe id or a result item id; the MOD locates a crafting table if needed, fills the grid from inventory and collects the output.{" "}
+                  <span className="font-mono text-[10px]">{`{"type":"craft","recipe":"minecraft:chest"}`}</span>
+                </td>
               </tr>
               <tr>
                 <td className="py-2 px-3 text-purple-400 font-bold">POST</td>
@@ -156,6 +187,27 @@ export const ProtocolDocs: React.FC<ProtocolDocsProps> = ({
                 className="text-[11px] font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-750 text-slate-300"
               >
                 select_hotbar
+              </button>
+              <button
+                type="button"
+                onClick={() => setCustomJson(`{\n  "type": "move_slot",\n  "from_slot": 12,\n  "to_slot": 0,\n  "swap": true\n}`)}
+                className="text-[11px] font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-750 text-amber-300"
+              >
+                move_slot
+              </button>
+              <button
+                type="button"
+                onClick={() => setCustomJson(`{\n  "type": "move_to_hotbar",\n  "item": "minecraft:diamond_pickaxe",\n  "slot": 0\n}`)}
+                className="text-[11px] font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-750 text-amber-300"
+              >
+                move_to_hotbar
+              </button>
+              <button
+                type="button"
+                onClick={() => setCustomJson(`{\n  "type": "craft",\n  "recipe": "minecraft:chest"\n}`)}
+                className="text-[11px] font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-750 text-emerald-300"
+              >
+                craft
               </button>
             </div>
 

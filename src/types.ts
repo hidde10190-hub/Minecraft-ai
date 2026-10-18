@@ -212,7 +212,7 @@ export interface TemporaryScaffoldBlock {
 }
 
 export interface ActionPacket {
-  type: "look_at" | "set_rotation" | "look_at_relative" | "w_tap" | "set_human_kinematics" | "press_key" | "release_key" | "release_all_keys" | "select_hotbar" | "place_block" | "attack_entity" | "drop_item" | "auto_build_litematica_step" | "send_chat" | "connect_server" | "reconnect" | "request_cube_map" | "scan_3d_cube" | "equip_item" | "toss_item" | "swap_hands" | "consume_item" | "mine" | "attack" | "dig" | "break_block" | "syncmatica_download_accept" | "swap_inventory_to_hotbar" | "navigate" | "place_temporary_scaffold" | "break_temporary_scaffold";
+  type: "look_at" | "set_rotation" | "look_at_relative" | "w_tap" | "set_human_kinematics" | "press_key" | "release_key" | "release_all_keys" | "select_hotbar" | "place_block" | "attack_entity" | "drop_item" | "auto_build_litematica_step" | "send_chat" | "connect_server" | "reconnect" | "request_cube_map" | "scan_3d_cube" | "equip_item" | "toss_item" | "swap_hands" | "consume_item" | "mine" | "attack" | "dig" | "break_block" | "syncmatica_download_accept" | "swap_inventory_to_hotbar" | "move_slot" | "move_to_hotbar" | "craft" | "navigate" | "place_temporary_scaffold" | "break_temporary_scaffold";
   x?: number;
   y?: number;
   z?: number;
@@ -242,6 +242,10 @@ export interface ActionPacket {
   id?: string;
   fromSlot?: number;
   toSlot?: number;
+  from_slot?: number;
+  to_slot?: number;
+  swap?: boolean;
+  recipe?: string;
 }
 
 export interface MemoryStep {
@@ -568,7 +572,158 @@ export interface UnifiedEnvConfig {
 // ------------------------------------------------------------------------------
 // Sign Perception, Reaction & Placement Types
 // ------------------------------------------------------------------------------
+/** Container regions used by the Visual Inventory Studio transfer simulation. */
+export type ContainerType =
+  | "hotbar"
+  | "main_inventory"
+  | "player_crafting_2x2"
+  | "table_crafting_3x3"
+  | "crafting_result"
+  | "furnace_input"
+  | "furnace_fuel"
+  | "furnace_output";
+
+/** A single verified inventory transfer event recorded in the Closed-Loop Verification Stream. */
+export interface VerifiedTransferEvent {
+  id: string;
+  timestamp: number;
+  fromContainer: ContainerType;
+  fromSlot: number;
+  toContainer: ContainerType;
+  toSlot: number;
+  item: string;
+  count: number;
+  expectedSourceDelta: number;
+  actualSourceDelta: number;
+  verified: boolean;
+  recoveryTriggered: boolean;
+  diagnosticNote: string;
+}
+
 export type WoodType = "oak" | "spruce" | "birch" | "jungle" | "acacia" | "dark_oak" | "mangrove" | "cherry" | "bamboo" | "crimson" | "warped";
+
+// ------------------------------------------------------------------------------
+// Progression, Persistent World Memory & Benchmark Replay Types
+// (used by ProgressionAndMemoryStudio)
+// ------------------------------------------------------------------------------
+
+/** A single trackable objective inside a progression milestone chain. */
+export interface ProgressionMilestone {
+  id: string;
+  title: string;
+  hint: string;
+  completed: boolean;
+  requiredCount: number;
+  currentCount: number;
+}
+
+/** A tiered chain of milestones describing the bot's tech-tree progression. */
+export interface ProgressionPath {
+  id: string;
+  title: string;
+  subtitle: string;
+  tier: number;
+  progressPercent: number;
+  milestones: ProgressionMilestone[];
+}
+
+/** A chest discovered and item-scanned in the world. */
+export interface ChestRecord {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  label: string;
+  items: { slot: number; item: string; count: number }[];
+  lastScannedAt: number;
+}
+
+/** A known ore/resource deposit location. */
+export interface ResourceDepositRecord {
+  id: string;
+  x: number;
+  y: number;
+  z: number;
+  resourceType: string;
+  count: number;
+  mined: boolean;
+}
+
+/** A placed utility station (crafting table, furnace, portal, ...). */
+export interface KnownStationRecord {
+  id: string;
+  type: "crafting_table" | "furnace" | "portal" | "bed" | "chest" | string;
+  x: number;
+  y: number;
+  z: number;
+  placedByAgent: string;
+}
+
+/** Node in the spatial knowledge graph. */
+export interface SpatialNode {
+  id: string;
+  label: string;
+  type: "base" | "mine" | "farm" | "portal" | "storage" | "danger" | string;
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** Edge (travelled connection) in the spatial knowledge graph. */
+export interface SpatialEdge {
+  id: string;
+  source: string;
+  target: string;
+  distance: number;
+  danger: "safe" | "moderate" | "hostile" | string;
+  traversalMode: "walk" | "bridge" | "tunnel" | "swim" | string;
+}
+
+/** Aggregated persistent world memory for an agent. */
+export interface PersistentWorldMemory {
+  baseCoords: [number, number, number];
+  chestRegistry: ChestRecord[];
+  resourceDeposits: ResourceDepositRecord[];
+  knownStations: KnownStationRecord[];
+  lastSaved: number;
+}
+
+/** Definition of a benchmark task the bot can be evaluated against. */
+export interface BenchmarkTaskDef {
+  id: string;
+  name: string;
+  category: "gathering" | "crafting" | "navigation" | "combat" | string;
+  description: string;
+  expectedDurationSec: number;
+  targetItem?: string;
+  targetCount?: number;
+  goalPrompt: string;
+}
+
+/** One recorded frame of a benchmark run replay. */
+export interface ReplayStepFrame {
+  step: number;
+  timestamp: number;
+  actionType: string;
+  detail: string;
+  verified: boolean;
+  inventoryPreview: string;
+  botThought: string;
+}
+
+/** Result of executing a benchmark task, including its replay frames. */
+export interface BenchmarkRun {
+  id: string;
+  taskId: string;
+  taskName: string;
+  passed: boolean;
+  durationMs: number;
+  wastedActions: number;
+  recoveryCount: number;
+  modelUsed: string;
+  timestamp: number;
+  frames: ReplayStepFrame[];
+}
 
 export interface SignText {
   messages: [string, string, string, string];

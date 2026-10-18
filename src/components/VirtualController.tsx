@@ -10,7 +10,8 @@ import {
   Check, 
   RotateCw,
   HandMetal,
-  Shield
+  Shield,
+  ArrowLeftRight
 } from "lucide-react";
 
 interface VirtualControllerProps {
@@ -26,6 +27,9 @@ export const VirtualController: React.FC<VirtualControllerProps> = ({
 }) => {
   const [targetLook, setTargetLook] = useState({ x: 104, y: 64, z: 20, ticks: 5 });
   const [customKeyDuration, setCustomKeyDuration] = useState(250);
+  const [moveTargetHotbarSlot, setMoveTargetHotbarSlot] = useState(0);
+  const [moveFromRaw, setMoveFromRaw] = useState("9");
+  const [moveToRaw, setMoveToRaw] = useState("0");
 
   const triggerKey = (key: string, durationMs: number = 200) => {
     onDispatchAction({
@@ -333,6 +337,93 @@ export const VirtualController: React.FC<VirtualControllerProps> = ({
                 </button>
               );
             })}
+          </div>
+        </div>
+
+        {/* Inventory -> Hotbar Quick Move (move_slot / move_to_hotbar action packets) */}
+        <div className="mt-4 pt-3 border-t border-slate-800">
+          <div className="flex items-center gap-2 mb-2">
+            <ArrowLeftRight className="h-3.5 w-3.5 text-amber-400" />
+            <span className="text-xs font-mono font-bold text-slate-300">Inventory → Hotbar Moves</span>
+            <span className="text-[10px] font-mono text-slate-500">(slots 9–35 main storage → hotbar 0–8)</span>
+          </div>
+
+          {(player.inventory && player.inventory.length > 0) ? (
+            <div className="grid grid-cols-9 gap-1.5 p-2 rounded-lg bg-slate-950/80 border border-slate-800">
+              {player.inventory
+                .filter((s) => s.slot >= 9 && s.slot <= 35 && s.item !== "minecraft:air" && s.count > 0)
+                .slice(0, 18)
+                .map((slot) => (
+                  <button
+                    key={slot.slot}
+                    type="button"
+                    onClick={() => {
+                      onDispatchAction({
+                        type: "move_to_hotbar",
+                        item: slot.item,
+                        slot: moveTargetHotbarSlot,
+                        swap: true,
+                      });
+                    }}
+                    className="relative flex flex-col items-center justify-center h-12 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-750 transition-all cursor-pointer"
+                    title={`Move ${slot.item} (slot ${slot.slot}) to hotbar slot ${moveTargetHotbarSlot}`}
+                  >
+                    <span className="absolute top-0.5 left-1 text-[8px] font-mono text-slate-500">{slot.slot}</span>
+                    <span className="text-[9px] font-mono truncate max-w-[90%] text-slate-200">
+                      {slot.item.replace("minecraft:", "")}
+                    </span>
+                    <span className="text-[9px] font-mono font-bold text-amber-300">x{slot.count}</span>
+                  </button>
+                ))}
+            </div>
+          ) : (
+            <div className="p-2 rounded-lg bg-slate-950/60 border border-slate-800 text-[10px] font-mono text-slate-500">
+              No main-inventory telemetry yet (requires full inventory export from /api/state).
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 mt-2">
+            <span className="text-[10px] font-mono text-slate-400">Destination hotbar slot:</span>
+            {Array.from({ length: 9 }).map((_, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => setMoveTargetHotbarSlot(i)}
+                className={`w-7 h-7 rounded font-mono text-[11px] font-bold border transition-all ${
+                  moveTargetHotbarSlot === i
+                    ? "bg-amber-500 text-slate-950 border-amber-400 ring-2 ring-amber-400/40"
+                    : "bg-slate-800 text-slate-300 border-slate-700 hover:bg-slate-750"
+                }`}
+              >
+                {i + 1}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => {
+                const from = Number(moveFromRaw);
+                const to = Number(moveToRaw);
+                if (Number.isFinite(from) && Number.isFinite(to)) {
+                  onDispatchAction({ type: "move_slot", from_slot: from, to_slot: to, swap: true });
+                }
+              }}
+              className="ml-auto px-2 py-1 rounded bg-indigo-950 hover:bg-indigo-900 text-indigo-300 text-[10px] font-mono border border-indigo-800 font-bold"
+              title="Move any slot to any slot (raw vanilla slot ids)"
+            >
+              Raw move_slot
+            </button>
+            <input
+              value={moveFromRaw}
+              onChange={(e) => setMoveFromRaw(e.target.value)}
+              placeholder="from"
+              className="w-14 px-1.5 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-200"
+            />
+            <input
+              value={moveToRaw}
+              onChange={(e) => setMoveToRaw(e.target.value)}
+              placeholder="to"
+              className="w-14 px-1.5 py-1 rounded bg-slate-900 border border-slate-700 text-[10px] font-mono text-slate-200"
+            />
           </div>
         </div>
       </div>

@@ -26,7 +26,8 @@ import {
   Search,
   Check,
   Trophy,
-  Hammer
+  Hammer,
+  Monitor
 } from "lucide-react";
 
 export interface NavCategory {
@@ -87,6 +88,7 @@ export const NAV_CATEGORIES: NavCategory[] = [
       { id: "progression", label: "Progression & World Memory", shortLabel: "Progression", description: "5 survival chains, persistent memory, spatial graph, and benchmark replays", icon: Trophy },
       { id: "skills", label: "Skills & Self-Learning", shortLabel: "Skills & Failures", description: "Self-learning engine, editable skills file, and failures memory", icon: Zap },
       { id: "standalone", label: "Standalone 26.2 Client", shortLabel: "Client Runner", description: "Headless client runner with ping diagnostics and Docker controls", icon: Server },
+      { id: "bot_screen", label: "Bot Screen (noVNC)", shortLabel: "Bot Screen", description: "Live noVNC stream of the bot's virtual display — watch and directly control Minecraft", icon: Monitor },
     ],
   },
   {

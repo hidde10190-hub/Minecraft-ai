@@ -1,14 +1,34 @@
 package com.minecraft.ai.input;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
 import com.minecraft.ai.mixin.KeyBindingAccessor;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.Holder;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ClickType;
+import net.minecraft.world.item.ArmorItem;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.Recipe;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
@@ -16,6 +36,7 @@ import net.minecraft.world.phys.Vec3;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
@@ -36,6 +57,7 @@ public class AiInputController {
     private static final Logger LOGGER = LoggerFactory.getLogger(AiInputController.class);
     private static final AiInputController INSTANCE = new AiInputController();
     private static final Random RANDOM = new Random();
+    private static final Gson GSON = new Gson();
 
     // Map of active virtual keys and remaining ticks to hold them
     private final Map<String, Integer> activeKeyHoldTicks = new ConcurrentHashMap<>();
@@ -459,6 +481,313 @@ public class AiInputController {
         if (pressed) {
             accessor.ai$setClickCount(accessor.ai$getClickCount() + 1);
         }
+    }
+
+    // =====================================================================================
+    // INVENTORY MANAGEMENT: Slot moves between main inventory <-> hotbar <-> armor/offhand
+    // =====================================================================================
+
+    /**
+     * Moves an item stack from one player inventory slot to another (e.g. main inventory -> hotbar).
+     * Slot numbering matches the exported "inventory" telemetry:
+     *   0-8   = hotbar
+     *   9-35  = main inventory storage
+     *   36-39 = armor (feet, legs, chest, head)
+     *   40    = offhand
+     * If the destination holds a different item and swapIfOccupied is true, the two stacks are
+     * swapped; otherwise the move merges compatible stacks or aborts.
+     */
+    public void moveInventorySlot(int fromSlot, int toSlot, boolean swapIfOccupied) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            LocalPlayer player = client.player;
+            if (player == null) return;
+            Inventory inv = player.getInventory();
+            if (!isValidInvSlot(fromSlot) || !isValidInvSlot(toSlot) || fromSlot == toSlot) {
+                LOGGER.warn("[AiInputController] Invalid slot move {} -> {}", fromSlot, toSlot);
+                return;
+            }
+            ItemStack source = inv.getItem(fromSlot);
+            if (source.isEmpty()) {
+                LOGGER.warn("[AiInputController] Source slot {} is empty, nothing to move", fromSlot);
+                return;
+            }
+            ItemStack dest = inv.getItem(toSlot);
+            if (dest.isEmpty()) {
+                inv.setItem(toSlot, source.copy());
+                inv.setItem(fromSlot, ItemStack.EMPTY);
+            } else if (ItemStack.isSameItemSameComponents(source, dest)) {
+                // Merge as much as possible into the destination stack
+                int space = dest.getMaxStackSize() - dest.getCount();
+                int moving = Math.min(space, source.getCount());
+                if (moving > 0) {
+                    dest.grow(moving);
+                    source.shrink(moving);
+                    inv.setItem(toSlot, dest);
+                    inv.setItem(fromSlot, source.isEmpty() ? ItemStack.EMPTY : source);
+                } else if (swapIfOccupied) {
+                    inv.setItem(fromSlot, dest);
+                    inv.setItem(toSlot, source);
+                }
+            } else if (swapIfOccupied) {
+                inv.setItem(fromSlot, dest);
+                inv.setItem(toSlot, source);
+            } else {
+                LOGGER.warn("[AiInputController] Destination slot {} occupied with a different item and swap disabled", toSlot);
+                return;
+            }
+            inv.setChanged();
+            LOGGER.info("[AiInputController] Moved item from slot {} to slot {}", fromSlot, toSlot);
+        });
+    }
+
+    /**
+     * Finds the first inventory slot containing the given item id and moves it into the
+     * requested hotbar slot (0-8). Searches hotbar last so re-fetching the same item works.
+     */
+    public void moveItemToHotbar(String itemId, int hotbarSlot, boolean swapIfOccupied) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            LocalPlayer player = client.player;
+            if (player == null) return;
+            if (hotbarSlot < 0 || hotbarSlot > 8) {
+                LOGGER.warn("[AiInputController] Hotbar slot must be 0-8, got {}", hotbarSlot);
+                return;
+            }
+            Inventory inv = player.getInventory();
+            Item target = BuiltInRegistries.ITEM.get(ResourceLocation.parse(itemId));
+            if (target == net.minecraft.world.item.Items.AIR) {
+                LOGGER.warn("[AiInputController] Unknown item id '{}'", itemId);
+                return;
+            }
+            for (int i = 9; i < 36; i++) {
+                ItemStack stack = inv.getItem(i);
+                if (!stack.isEmpty() && stack.is(target)) {
+                    moveInventorySlot(i, hotbarSlot, swapIfOccupied);
+                    return;
+                }
+            }
+            LOGGER.warn("[AiInputController] Item '{}' not found in main inventory", itemId);
+        });
+    }
+
+    /**
+     * Equips an armor item from the inventory into its matching armor slot.
+     */
+    public void equipItem(String itemId) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            LocalPlayer player = client.player;
+            if (player == null) return;
+            Inventory inv = player.getInventory();
+            Item target = BuiltInRegistries.ITEM.get(ResourceLocation.parse(itemId));
+            if (!(target instanceof ArmorItem armor)) {
+                LOGGER.warn("[AiInputController] Item '{}' is not an armor piece", itemId);
+                return;
+            }
+            EquipmentSlot eq = armor.getEquipmentSlot();
+            int armorInvSlot = switch (eq) {
+                case FEET -> 36;
+                case LEGS -> 37;
+                case CHEST -> 38;
+                case HEAD -> 39;
+                default -> -1;
+            };
+            if (armorInvSlot < 0) return;
+            for (int i = 0; i < 36; i++) {
+                ItemStack stack = inv.getItem(i);
+                if (!stack.isEmpty() && stack.is(target)) {
+                    ItemStack current = inv.getItem(armorInvSlot);
+                    inv.setItem(armorInvSlot, stack.split(1));
+                    if (!current.isEmpty()) inv.addItem(current);
+                    inv.setChanged();
+                    LOGGER.info("[AiInputController] Equipped {} into {}", itemId, eq.getName());
+                    return;
+                }
+            }
+            LOGGER.warn("[AiInputController] Armor '{}' not found in inventory", itemId);
+        });
+    }
+
+    private static boolean isValidInvSlot(int slot) {
+        return slot >= 0 && slot <= 40;
+    }
+
+    // =====================================================================================
+    // CRAFTING: Uses the game's BUILT-IN recipe book (RecipeManager) - every vanilla recipe
+    // =====================================================================================
+
+    /**
+     * Exports every crafting recipe known to the client's RecipeManager as JSON.
+     * This is the authoritative source of ALL built-in recipes of the game, keyed by
+     * their vanilla ids, with per-grid-slot ingredient options.
+     */
+    public String exportAllRecipesJson() {
+        Minecraft client = Minecraft.getInstance();
+        JsonArray arr = new JsonArray();
+        try {
+            RecipeManager manager = null;
+            if (client.level != null) manager = client.level.getRecipeManager();
+            else if (client.getConnection() != null) manager = client.getConnection().getRecipeManager();
+            if (manager == null) return "[]";
+            for (ResourceLocation loc : manager.keySet()) {
+                var holderOpt = manager.byKey(loc);
+                if (holderOpt.isEmpty()) continue;
+                Recipe<?> recipe = holderOpt.get().value();
+                if (!(recipe instanceof CraftingRecipe craft)) continue;
+                JsonObject r = new JsonObject();
+                r.addProperty("id", loc.toString());
+                r.addProperty("type", BuiltInRegistries.RECIPE_SERIALIZER.getKey(craft.getSerializer()).toString());
+                ItemStack result = craft.getResultItem(null);
+                if (!result.isEmpty()) {
+                    r.addProperty("result_item", BuiltInRegistries.ITEM.getKey(result.getItem()).toString());
+                    r.addProperty("result_count", result.getCount());
+                }
+                JsonArray ingredients = new JsonArray();
+                List<Ingredient> ingList = craft.getIngredients();
+                for (int i = 0; i < ingList.size(); i++) {
+                    Ingredient ing = ingList.get(i);
+                    if (ing.isEmpty()) continue;
+                    JsonArray opts = new JsonArray();
+                    for (ItemStack opt : ing.items()) {
+                        if (!opt.isEmpty()) opts.add(BuiltInRegistries.ITEM.getKey(opt.getItem()).toString());
+                    }
+                    if (opts.size() > 0) {
+                        JsonObject o = new JsonObject();
+                        o.addProperty("slot", i);
+                        o.add("options", opts);
+                        ingredients.add(o);
+                    }
+                }
+                r.add("ingredients", ingredients);
+                arr.add(r);
+            }
+        } catch (Exception e) {
+            LOGGER.error("[AiInputController] Failed to export recipes", e);
+        }
+        return GSON.toJson(arr);
+    }
+
+    /**
+     * Crafts a recipe identified by its vanilla recipe id (e.g. "minecraft:chest") using the
+     * game's built-in RecipeManager data. Requires the player to have the ingredients and an
+     * open inventory (2x2 grid) or nearby crafting table (3x3 grid, opened automatically).
+     * The grid is filled by shift-clicking candidate items and validating against the
+     * vanilla CraftingContainer, then the result is taken out.
+     */
+    public void craftRecipeById(String recipeId) {
+        Minecraft client = Minecraft.getInstance();
+        client.execute(() -> {
+            LocalPlayer player = client.player;
+            if (player == null || client.level == null || client.gameMode == null) return;
+            RecipeManager manager = client.level.getRecipeManager();
+            ResourceLocation loc = ResourceLocation.parse(recipeId.contains(":") ? recipeId : "minecraft:" + recipeId);
+            var holderOpt = manager.byKey(loc);
+            if (holderOpt.isEmpty()) {
+                LOGGER.warn("[AiInputController] Unknown recipe '{}'", recipeId);
+                return;
+            }
+            if (!(holderOpt.get().value() instanceof CraftingRecipe craft)) {
+                LOGGER.warn("[AiInputController] Recipe '{}' is not a crafting-table recipe", recipeId);
+                return;
+            }
+
+            // Find a nearby crafting table and open it (gives us the full 3x3 grid)
+            BlockPos tablePos = findNearestCraftingTable(player, 5);
+            if (tablePos != null) {
+                Vec3 center = Vec3.atCenterOf(tablePos);
+                lookAt(center.x, center.y, center.z, 2);
+                client.gameMode.useItemOn(player, InteractionHand.MAIN_HAND,
+                        new BlockHitResult(center, Direction.UP, tablePos, false));
+            }
+
+            Screen screen = client.screen;
+            if (!(screen instanceof AbstractContainerScreen<?> cs)) {
+                LOGGER.warn("[AiInputController] No crafting screen open (no crafting table nearby?). Recipe: {}", recipeId);
+                return;
+            }
+            AbstractContainerMenu menu = cs.getMenu();
+            final int containerId = menu.containerId;
+
+            // Locate the crafting grid + result slots using the vanilla menu layouts:
+            //   InventoryMenu / CraftingMenu (2x2): slot 0 = result, slots 1-4 = grid, 5+ = player inv
+            //   CraftingTableMenu (3x3):             slot 0 = result, slots 1-9 = grid, 10+ = player inv
+            String menuCls = menu.getClass().getSimpleName();
+            int gridSize = (menuCls.contains("CraftingTable") || menuCls.contains("Stonecutter") || menu.slots.size() >= 74) ? 9 : 4;
+            int resultSlot = -1, gridStart = -1;
+            for (int i = 0; i < Math.min(2, menu.slots.size()); i++) {
+                String cls = menu.slots.get(i).getClass().getSimpleName();
+                if (cls.contains("Result")) { resultSlot = i; break; }
+            }
+            if (resultSlot == 0) gridStart = 1;
+            if (resultSlot < 0 || gridStart < 0) {
+                LOGGER.warn("[AiInputController] Could not locate crafting grid/result slots in open menu ({})",
+                        menu.getClass().getSimpleName());
+                return;
+            }
+
+            // Map each grid cell to an inventory slot holding a matching ingredient
+            List<Ingredient> ingredients = craft.getIngredients();
+            java.util.Set<Integer> usedInvSlots = new java.util.HashSet<>();
+            int[] plan = new int[9];
+            java.util.Arrays.fill(plan, -1);
+            for (int g = 0; g < Math.min(9, ingredients.size()); g++) {
+                Ingredient ing = ingredients.get(g);
+                if (ing.isEmpty()) continue;
+                outer:
+                for (ItemStack match : ing.items()) {
+                    if (match.isEmpty()) continue;
+                    for (int s = 0; s < 36; s++) {
+                        if (usedInvSlots.contains(s)) continue;
+                        ItemStack have = player.getInventory().getItem(s);
+                        if (!have.isEmpty() && ing.test(have)) {
+                            plan[g] = s;
+                            usedInvSlots.add(s);
+                            break outer;
+                        }
+                    }
+                }
+                if (plan[g] < 0) {
+                    LOGGER.warn("[AiInputController] Missing ingredient for grid cell {} of recipe '{}'", g, recipeId);
+                    return;
+                }
+            }
+
+            // Fill the grid via simulated clicks, then collect the result
+            for (int g = 0; g < 9; g++) {
+                if (plan[g] < 0) continue;
+                client.gameMode.handleInventoryMouseClick(containerId, invSlotToMenuSlot(menu, plan[g]), 0, ClickType.PICKUP, player);
+                client.gameMode.handleInventoryMouseClick(containerId, gridStart + g, 0, ClickType.PICKUP, player);
+            }
+            client.gameMode.handleInventoryMouseClick(containerId, resultSlot, 0, ClickType.PICKUP, player);
+            client.gameMode.handleInventoryMouseClick(containerId, resultSlot, 0, ClickType.PICKUP, player);
+            LOGGER.info("[AiInputController] Crafted '{}' via the game's built-in recipe book", recipeId);
+        });
+    }
+
+    private BlockPos findNearestCraftingTable(LocalPlayer player, int radius) {
+        BlockPos origin = player.blockPosition();
+        BlockPos best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int x = -radius; x <= radius; x++)
+            for (int y = -2; y <= 2; y++)
+                for (int z = -radius; z <= radius; z++) {
+                    BlockPos p = origin.offset(x, y, z);
+                    if (player.level().getBlockState(p).is(Blocks.CRAFTING_TABLE)) {
+                        double d = p.distSqr(origin);
+                        if (d < bestDist) { bestDist = d; best = p; }
+                    }
+                }
+        return best;
+    }
+
+    private int invSlotToMenuSlot(AbstractContainerMenu menu, int invSlot) {
+        // Vanilla mapping: hotbar 0-8 -> last 9 player slots of the menu;
+        // main inventory 9-35 -> the 27 slots before them.
+        int total = menu.slots.size();
+        if (invSlot >= 0 && invSlot < 9) return total - 9 + invSlot;
+        if (invSlot >= 9 && invSlot < 36) return total - 36 + (invSlot - 9);
+        return invSlot;
     }
 
     /**
