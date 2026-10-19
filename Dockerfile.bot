@@ -14,22 +14,11 @@ RUN npm install
 COPY . .
 RUN npm run build:bot || true
 
-# Supervisor config: Xvfb on :1, x11vnc on :5900, websockify/noVNC on :6080, bot process
-RUN printf '[program:xvfb]\n\
-command=Xvfb :1 -screen 0 1280x720x24\n\
-autorestart=true\n\
-[program:x11vnc]\n\
-command=x11vnc -display :1 -forever -shared -rfbport 5900 -nopw\n\
-autorestart=true\n\
-startsecs=3\n\
-[program:novnc]\n\
-command=websockify --web=/usr/share/novnc/ 6080 localhost:5900\n\
-autorestart=true\n\
-startsecs=3\n\
-[program:bot]\n\
-command=node dist/bot/index.js\n\
-environment=DISPLAY=":1"\n\
-autorestart=true\n\
+# Supervisor config: Xvfb on :1, x11vnc on :5900, websockify/noVNC on :6080, bot process.
+# The config lives in supervisord.conf (copied in via "COPY . ." above) and is placed
+# where Debian's supervisord looks for configs by default.
+RUN mkdir -p /etc/supervisor/conf.d \
+    && cp /bot/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
 
 EXPOSE 6080 5900
-CMD ["supervisord", "-n"]
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]

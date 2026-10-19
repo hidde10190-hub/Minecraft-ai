@@ -23,12 +23,12 @@ if %ERRORLEVEL% EQU 0 (
     echo.
     REM Aggressive Cleanup (The Nuclear Fix)
     echo [Status] Performing Nuclear Fix to ensure no stale containers exist...
-    
+
         REM 0. Kill leftover Gradle daemons and wipe stale Fabric Loom locks from the
     REM    named cache volume.
     echo [Cleanup] Terminating stale wslrelay processes locking port 3000...
     taskkill /F /IM wslrelay.exe >nul 2>&1
-    
+
     echo [Cleanup] Killing stale Gradle daemons and clearing Fabric Loom locks...
     docker exec minecraft-fabric-standalone bash -c "kill -9 \$(pgrep java) 2>/dev/null; cd /app/framework 2>/dev/null && ./gradlew --stop 2>/dev/null" >nul 2>&1
     docker run --rm -v minecraft-gradle-cache:/g alpine sh -c "find /g -name '*.lock' -delete; find /g -name 'registry.lock' -delete" >nul 2>&1
@@ -36,29 +36,29 @@ if %ERRORLEVEL% EQU 0 (
 REM 1. Try to stop our specific names first
     docker stop minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >nul 2>&1
     docker rm -f minecraft-fabric-standalone minecraft-ai-dashboard minecraft-ollama >nul 2>&1
-    
+
     REM 2. Down with volumes and orphans to be absolutely sure
     docker compose down --remove-orphans >nul 2>&1
-    
+
     REM 3. Kill ANY container using our ports (3000, 8080, 8079, 11434)
     for /f "tokens=*" %%i in ('docker ps -aq --filter "publish=3000" --filter "publish=8080" --filter "publish=8079" --filter "publish=11434"') do (
         echo [Cleanup] Stopping containers bound to ports 3000, 8080, 11434...
         docker stop %%i >nul 2>&1
         docker rm -f %%i >nul 2>&1
     )
-    
+
     REM 4. Prune exhausted subnets and stale Docker bridge networks
     echo [Status] Pruning unused Docker networks to prevent subnet pool exhaustion...
     docker network prune -f >nul 2>&1
-    
+
     set "MINECRAFT_SERVER=%SERVER%"
     set "MINECRAFT_SERVER_HOST=%SERVER%"
     set "MINECRAFT_BOT_USERNAME=%BOT_NAME%"
     set "BOT_NAME=%BOT_NAME%"
-    
+
     echo [Status] Launching fresh containers...
     docker compose up -d --remove-orphans
-    
+
     if %ERRORLEVEL% NEQ 0 (
         echo [Warning] Docker Compose failed. Pruning subnetted networks and retrying...
         docker network prune -f >nul 2>&1
@@ -68,8 +68,22 @@ REM 1. Try to stop our specific names first
             goto :NATIVE
         )
     )
-    
+
     echo.
+    echo =====================================================================
+    REM The dashboard container builds its bundle on first boot (npm ci + vite build),
+    REM which can take a couple of minutes. Wait until it is actually listening,
+    REM then surface the URLs so the dashboard does not look like it 'disappeared'.
+    echo [Status] Waiting for the dashboard to finish building and come online...
+    powershell -NoProfile -Command "for($i=0;$i -lt 60;$i++){ try { Invoke-WebRequest -Uri http://localhost:3000 -UseBasicParsing -TimeoutSec 2 | Out-Null; exit 0 } catch { Start-Sleep -Seconds 5 } }; exit 1"
+    if %ERRORLEVEL% EQU 0 (
+        echo   Dashboard is ONLINE    : http://localhost:3000
+        echo   Live bot view - noVNC  : http://localhost:6080/vnc.html
+    ) else (
+        echo [Info] Dashboard not reachable yet; it may still be building its web bundle.
+        echo        Check progress with: docker logs -f minecraft-ai-dashboard
+    )
+
     echo =====================================================================
     echo   Client container is active! Streaming live logs below.
     echo   Press Ctrl+C at any time to stop viewing logs.
@@ -89,8 +103,7 @@ if exist "run-standalone-client.bat" (
 )
 if %ERRORLEVEL% NEQ 0 (
     echo.
-    echo [Error] Minecraft client exited with an error. 
+    echo [Error] Minecraft client exited with an error.
     echo Check the logs above for any dependency or mapping errors.
 )
 pause
-

@@ -57,7 +57,7 @@ services:
         reservations:
           cpus: '3.0'      # Guarantee cores so the client isn't throttled under load
           memory: 5G       # Guarantee so Java never gets squeezed by other containers
-    
+
     # Enable hardware acceleration if a GPU is present (requires nvidia-container-toolkit)
     # deploy:
     #   resources:
@@ -66,7 +66,7 @@ services:
     #         - driver: nvidia
     #           count: 1
     #           capabilities: [gpu]
-    
+
     shm_size: '4gb'
     # Performance tuning:
     #  - mem_swappiness=0: stop swapping the Java heap out (major cause of GC pauses/lag)
@@ -108,39 +108,28 @@ services:
                sleep 2 &&
                (x11vnc -display :99 -forever -shared -nopw -rfbport 5900 -bg -o /tmp/x11vnc.log 2>/dev/null || true) &&
                (websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/novnc.log 2>&1 &) || true &&
-               export MINECRAFT_SERVER_HOST=\"$$MINECRAFT_SERVER\" &&
-               export MINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" &&
+               export MINECRAFT_SERVER_HOST=\"$MINECRAFT_SERVER\" &&
+               export MINECRAFT_BOT_USERNAME=\"$BOT_NAME\" &&
                echo '=====================================================' &&
                echo ' [Standalone Container] Launching Fabric Client (Java 25)' &&
-               echo ' Server   : '\"$$MINECRAFT_SERVER\" &&
-               echo ' Username : '\"$$BOT_NAME\" &&
+               echo ' Server   : ' \"$MINECRAFT_SERVER\" &&
+               echo ' Username : ' \"$BOT_NAME\" &&
                echo '=====================================================' &&
-               chmod +x ./gradlew && 
-               (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon || 
-                (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$$BOT_NAME\" --args=\"--username $$BOT_NAME\" --no-daemon))"
+               chmod +x ./gradlew &&
+               (./gradlew runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$BOT_NAME\" -DMINECRAFT_BOT_USERNAME=\"$BOT_NAME\" --args=\"--username $BOT_NAME\" --no-daemon ||
+                (echo 'Build failed. Attempting clean build...' && rm -rf .gradle/loom-cache build && ./gradlew clean runClient -Dfabric.gui.disable=true -Dminecraft.ai.server=\"$MINECRAFT_SERVER\" -Dminecraft.ai.botname=\"$BOT_NAME\" --args=\"--username $BOT_NAME\" --no-daemon))"
 
-  # Headless Minecraft (Mineflayer) bot inside a virtual X display.
-  # x11vnc exposes DISPLAY=:1 on :5900, websockify+noVNC serves it on :6080.
-  minecraft-bot:
-    build:
-      context: .
-      dockerfile: Dockerfile.bot
-    container_name: voxel-swarm-bot
-    environment:
-      DISPLAY: ":1"
-      MINECRAFT_HOST: "minecraft-server"
-      MINECRAFT_PORT: "25565"
-      BOT_USERNAME: "SwarmBot"
-    ports:
-      - "6080:6080"   # noVNC web client (http://localhost:6080/vnc.html)
-      - "5900:5900"   # raw VNC (optional, for external VNC viewers)
-    depends_on:
-      - minecraft-server
-    restart: unless-stopped
-
+  # NOTE: the optional Mineflayer demo bot (minecraft-bot) and the bundled test
+  # server (minecraft-server) have been moved behind the "local-server" profile
+  # below. start.bat targets an EXTERNAL server (host.docker.internal:25565), so
+  # `docker compose up` must not pull the ~500MB itzg/minecraft-server image or
+  # try to build the bot image (Dockerfile.bot references a dist/bot bundle that
+  # package.json does not define). To opt back in:
+  #   docker compose --profile local-server up -d
   minecraft-server:
     image: itzg/minecraft-server:java21  # pinned Java family (was :latest); digest sha256:ad224ad3...975c on 2026-10-17
     container_name: voxel-swarm-mc
+    profiles: ["local-server"]
     environment:
       EULA: "TRUE"
       VERSION: "1.20.4"
@@ -153,6 +142,58 @@ services:
       - mc-data:/data
     restart: unless-stopped
 
+  # Headless Minecraft (Mineflayer) bot inside a virtual X display.
+  # x11vnc exposes DISPLAY=:1 on :5900, websockify+noVNC serves it on :6080.
+  minecraft-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: voxel-swarm-bot
+    profiles: ["local-server"]
+    environment:
+      DISPLAY: ":1"
+      MINECRAFT_HOST: "minecraft-server"
+      MINECRAFT_PORT: "25565"
+      BOT_USERNAME: "SwarmBot"
+    ports:
+      - "5900:5900"   # raw VNC (optional, for external VNC viewers)
+      # 6080 intentionally NOT published here: the Fabric client container above
+      # already owns host port 6080 for its own noVNC stream (duplicate binding
+      # made `docker compose up` fail even when both containers started).
+    depends_on:
+      - minecraft-server
+    restart: unless-stopped
+
+  # Web dashboard (React UI + Node bridge control panel, server.ts, port 3000).
+  # Previously this only existed in docker-compose.server.yml, which start.bat
+  # never loads -- that is why the dashboard "disappeared". It proxies the bot's
+  # live game view from the Fabric client container's noVNC stream (BRIDGE_HOST
+  # -> port 6080), so no extra host-port conflict is introduced.
+  dashboard:
+    image: node:22-bookworm
+    container_name: minecraft-ai-dashboard
+    working_dir: /app
+    restart: unless-stopped
+    env_file:
+      - config.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - BRIDGE_HOST=minecraft-fabric-standalone
+      - VNC_WS_PORT=6080
+    volumes:
+      - ./:/app
+      - dashboard_node_modules:/app/node_modules
+    ports:
+      - "3000:3000"   # http://localhost:3000
+    command: >
+      sh -c "npm ci --ignore-scripts --no-audit --no-fund &&
+             npm run build &&
+             exec node dist/server.cjs"
+    depends_on:
+      - minecraft-standalone-client
+
 volumes:
   mc-data:
   gradle_cache:
+  dashboard_node_modules:
